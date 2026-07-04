@@ -22,8 +22,15 @@ from connectchain.lcel import model
 
 class PortableOrchestrator:
     """
-    This class is a portable orchestrator that can be used to run a query against any chain.
-    It is portable as it can wrap any third-party LLM framework.
+    This class is a portable orchestrator that can be used to run a query
+    against any chain.  It is portable as it can wrap any third-party LLM
+    framework.
+
+    BUG-3 FIX: run_sync() and run() previously called the deprecated
+    LLMChain.run() / LLMChain.arun() methods which are scheduled for removal
+    in LangChain 0.4.x.  Both methods now use the LCEL .invoke() / .ainvoke()
+    API instead.  A key-fallback ('text' then 'output') ensures compatibility
+    with chains that use either output key.
     """
 
     def __init__(self, chain: connectchain.chains.ValidLLMChain, **kvargs: Any) -> None:
@@ -54,9 +61,15 @@ class PortableOrchestrator:
         return PortableOrchestrator(chain)
 
     def run_sync(self, query: str) -> Any:
-        """Run the chain synchronously"""
-        return self._chain.run(query)
+        """Run the chain synchronously via LCEL .invoke()."""
+        result = self._chain.invoke({"input": query})
+        if isinstance(result, dict):
+            return result.get("text") or result.get("output") or str(result)
+        return result
 
     async def run(self, query: str) -> Any:
-        """Run the chain asynchronously"""
-        return await self._chain.arun(query)
+        """Run the chain asynchronously via LCEL .ainvoke()."""
+        result = await self._chain.ainvoke({"input": query})
+        if isinstance(result, dict):
+            return result.get("text") or result.get("output") or str(result)
+        return result

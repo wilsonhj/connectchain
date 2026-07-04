@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 """LCEL model module"""
+import logging
 import os
 from typing import Any
 
@@ -19,6 +20,8 @@ from pydantic import SecretStr
 
 from connectchain.utils import Config, SessionMap, get_token_from_env
 from connectchain.utils.llm_proxy_wrapper import wrap_llm_with_proxy
+
+logger = logging.getLogger(__name__)
 
 
 class LCELModelException(BaseException):
@@ -45,10 +48,8 @@ def _get_model_(index: Any) -> BaseLanguageModel:
     if model_config is None:
         raise LCELModelException(f'Model config at index "{index}" is not defined')
 
-    # Check if we should use direct access (no EAS)
     needs_eas = False
     try:
-        # Check if EAS is configured and not bypassed
         if (
             hasattr(config, "eas")
             and config.eas
@@ -60,15 +61,12 @@ def _get_model_(index: Any) -> BaseLanguageModel:
     except (AttributeError, KeyError):
         needs_eas = False
 
-    # For non-OpenAI providers, always use direct access
     if model_config.provider != "openai":
         needs_eas = False
 
     if needs_eas:
-        # Use existing EAS flow for OpenAI
         model_instance = _get_openai_model_(index, config, model_config)
     else:
-        # Use direct access for any provider
         model_instance = _get_direct_model_(model_config)
 
     if model_instance is None:
@@ -76,16 +74,13 @@ def _get_model_(index: Any) -> BaseLanguageModel:
     try:
         proxy_config = model_config.proxy
     except KeyError:
-        # Proxy settings not required
         pass
     if proxy_config is None:
         try:
             proxy_config = config.proxy
-            # Proxy settings not required
         except KeyError:
             pass
     if proxy_config is not None:
-        # Convert to BaseLLM if needed for proxy wrapping
         wrap_llm_with_proxy(model_instance, proxy_config)  # type: ignore[arg-type]
     return model_instance
 
@@ -102,17 +97,14 @@ def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLangua
             llm: BaseLanguageModel = _get_chat_model_(auth_token, model_config)
         else:
             llm = _get_azure_model_(auth_token, model_config)
-        # Note: SessionMap expects LLMResult but we're storing LLM instances
         session_map.new_session(model_session_key, llm)  # type: ignore[arg-type]
         return llm
-    # Note: SessionMap returns LLMResult but we need BaseLanguageModel
     return session_map.get_llm(model_session_key)  # type: ignore[return-value]
 
 
 def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
     """Get a ChatOpenAI instance"""
-    llm = ChatOpenAI(
-        # Note: ChatOpenAI uses model parameter
+    return ChatOpenAI(
         model=model_config.model_name,
         api_key=SecretStr(auth_token) if auth_token else None,
         base_url=model_config.api_base,
@@ -122,13 +114,11 @@ def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
             "api_type": "azure",
         },
     )
-    return llm
 
 
 def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
     """Get an AzureOpenAI instance"""
-    llm = AzureOpenAI(
-        # Note: AzureOpenAI uses model parameter
+    return AzureOpenAI(
         model=model_config.model_name,
         api_key=SecretStr(auth_token) if auth_token else None,
         azure_endpoint=model_config.api_base,
@@ -139,49 +129,55 @@ def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
             "api_type": "azure",
         },
     )
-    return llm
 
 
 def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
-    """Get a direct API model instance for any provider without EAS authentication"""
+    """Get a direct API model instance for any provider without EAS authentication.
 
+    BUG-4 FIX: Replaced bare `pass` in the except block with structured
+    logging.  ImportError and ValueError are expected fallback conditions
+    (missing provider package or bad model name) and emit a WARNING before
+    falling through to the manual provider init.  All other exceptions are
+    unexpected and are re-raised as LCELModelException with the original
+    traceback preserved via `raise ... from e`.
+    """
     try:
-        # Try using LangChain's automatic model initialization
-        from langchain.chat_models import init_chat_model
+        from langchain.chat_models import init_chat_model  # pylint: disable=import-outside-toplevel
 
-        # Prepare model name
         model_name = model_config.model_name
+        config_dict: dict = {}
 
-        # Prepare configuration kwargs
-        config_dict = {}
-
-        # Add custom API base if specified
         if hasattr(model_config, "api_base") and model_config.api_base:
             config_dict["base_url"] = model_config.api_base
-
-        # Add temperature if specified
         if hasattr(model_config, "temperature"):
             config_dict["temperature"] = model_config.temperature
 
-        # Handle custom API key environment variable
         api_key_env = getattr(model_config, "api_key_env", None)
         if api_key_env:
             api_key = os.getenv(api_key_env)
             if api_key:
                 config_dict["api_key"] = api_key
 
-        # Try automatic initialization
         return init_chat_model(model_name, **config_dict)
 
-    except (ImportError, ValueError, Exception) as e:
-        # Fallback to manual provider-specific initialization
-        pass
+    except (ImportError, ValueError) as e:
+        # Expected: missing provider package or unrecognised model name.
+        # Log and fall through to the manual initialisation block below.
+        logger.warning(
+            "init_chat_model() failed for '%s' (%s: %s); falling back to manual provider init.",
+            model_config.model_name,
+            type(e).__name__,
+            e,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        # Unexpected failure: preserve the original traceback.
+        raise LCELModelException(
+            f"Unexpected error initialising model '{model_config.model_name}': {e}"
+        ) from e
 
-    # Manual provider-specific initialization as fallback
-    # Determine API key environment variable
+    # ── Manual provider-specific initialisation fallback ──────────────────────
     api_key_env = getattr(model_config, "api_key_env", None)
     if not api_key_env:
-        # Default to {PROVIDER}_API_KEY pattern
         api_key_env = f"{model_config.provider.upper()}_API_KEY"
 
     api_key = os.getenv(api_key_env)
@@ -191,14 +187,10 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             f"Please set it in your .env file or environment."
         )
 
-    # Provider-specific instantiation
     if model_config.provider == "openai":
-        # Check if this is Azure OpenAI based on api_base
         api_base = getattr(model_config, "api_base", None)
         is_azure = api_base and "openai.azure.com" in str(api_base)
-
         if is_azure and hasattr(model_config, "api_version"):
-            # Azure OpenAI with direct API key
             return AzureOpenAI(
                 model=model_config.model_name,
                 api_key=SecretStr(api_key),
@@ -210,67 +202,61 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                     "api_type": "azure",
                 },
             )
-        else:
-            # Standard OpenAI
-            return ChatOpenAI(
-                model=model_config.model_name,
-                api_key=api_key,
-                base_url=api_base,  # Can be None for default OpenAI endpoint
-            )
+        return ChatOpenAI(
+            model=model_config.model_name,
+            api_key=api_key,
+            base_url=api_base,
+        )
 
     elif model_config.provider == "anthropic":
         try:
-            from langchain_anthropic import ChatAnthropic
-
+            from langchain_anthropic import ChatAnthropic  # pylint: disable=import-outside-toplevel
             return ChatAnthropic(
                 model=model_config.model_name,
                 anthropic_api_key=api_key,
                 anthropic_api_url=getattr(model_config, "api_base", None),
             )
-        except ImportError:
+        except ImportError as exc:
             raise LCELModelException(
                 "langchain-anthropic not installed. Run: pip install langchain-anthropic"
-            )
+            ) from exc
 
     elif model_config.provider == "google":
         try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-
+            from langchain_google_genai import ChatGoogleGenerativeAI  # pylint: disable=import-outside-toplevel
             return ChatGoogleGenerativeAI(
                 model=model_config.model_name,
                 google_api_key=api_key,
             )
-        except ImportError:
+        except ImportError as exc:
             raise LCELModelException(
                 "langchain-google-genai not installed. Run: pip install langchain-google-genai"
-            )
+            ) from exc
 
     elif model_config.provider == "cohere":
         try:
-            from langchain_cohere import ChatCohere
-
+            from langchain_cohere import ChatCohere  # pylint: disable=import-outside-toplevel
             return ChatCohere(
                 model=model_config.model_name,
                 cohere_api_key=api_key,
             )
-        except ImportError:
+        except ImportError as exc:
             raise LCELModelException(
                 "langchain-cohere not installed. Run: pip install langchain-cohere"
-            )
+            ) from exc
 
     elif model_config.provider == "huggingface":
         try:
-            from langchain_huggingface import HuggingFaceEndpoint
-
+            from langchain_huggingface import HuggingFaceEndpoint  # pylint: disable=import-outside-toplevel
             return HuggingFaceEndpoint(
                 repo_id=model_config.model_name,
                 huggingfacehub_api_token=api_key,
                 endpoint_url=getattr(model_config, "api_base", None),
             )
-        except ImportError:
+        except ImportError as exc:
             raise LCELModelException(
                 "langchain-huggingface not installed. Run: pip install langchain-huggingface"
-            )
+            ) from exc
 
     else:
         raise LCELModelException(

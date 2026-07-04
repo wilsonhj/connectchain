@@ -11,7 +11,7 @@
 # the License.
 """
 This module contains the ValidLLMChain class, which is a subclass of LLMChain.
-In addition, it has a callback for sanitizing the output
+In addition, it has a callback for sanitizing the output.
 """
 from typing import Any, Callable, Dict, List, Optional
 
@@ -22,8 +22,12 @@ from langchain.chains.llm import LLMChain
 class ValidLLMChain(LLMChain):
     # pylint: disable=too-few-public-methods
     """
-    Extension to LLMChain that sanitizes the output if provided with a sanitizer function
+    Extension to LLMChain that sanitizes the **output** if provided with a
+    sanitizer function.  The sanitizer is intentionally applied *after* the
+    LLM call so that it can inspect or transform the model response — not
+    the user's raw input.
     """
+
     output_sanitizer: Optional[Callable[[str], str]]
 
     def run(
@@ -35,7 +39,29 @@ class ValidLLMChain(LLMChain):
         **kwargs: Any,
     ) -> Any:
         # pylint: disable=unused-argument
-        """Run the chain with the given input and return the output"""
-        query = self.output_sanitizer(args[0]) if self.output_sanitizer else args[0]
+        """Run the chain and sanitize the LLM *response* before returning.
 
-        return super().run(query, callbacks=callbacks, tags=tags, metadata=metadata)
+        BUG-1 FIX: Previously the sanitizer was applied to args[0] (the user
+        query) before calling super().run(), meaning the actual model output
+        was never sanitized.  The fix calls super().run() first and passes the
+        result through the sanitizer.
+        """
+        result = super().run(args[0], callbacks=callbacks, tags=tags, metadata=metadata)
+        return self.output_sanitizer(result) if self.output_sanitizer else result
+
+    async def arun(
+        self,
+        *args: Any,
+        callbacks: Callbacks = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        # pylint: disable=unused-argument
+        """Async variant — sanitize the LLM *response* before returning.
+
+        BUG-1 FIX (async): Without this override the output_sanitizer is
+        silently skipped on all async invocations.
+        """
+        result = await super().arun(args[0], callbacks=callbacks, tags=tags, metadata=metadata)
+        return self.output_sanitizer(result) if self.output_sanitizer else result

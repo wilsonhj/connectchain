@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 """This module is used to keep track of the session expiration time"""
+import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,9 +18,16 @@ from langchain.schema import LLMResult
 
 
 class SessionMap:
-    """This class is used to keep track of the session expiration time"""
+    """This class is used to keep track of the session expiration time.
+
+    BUG-2 FIX: Added existence guard in is_expired() to prevent KeyError when
+    a session_id has not yet been registered (returns True so callers trigger
+    a token refresh).  A threading.Lock() protects all read/write operations
+    to avoid race conditions under concurrent async load.
+    """
 
     _instance: Optional["SessionMap"] = None
+    _lock: threading.Lock = threading.Lock()
     session_map: Dict[str, Tuple[datetime, LLMResult]] = {}
     expires_in: int = -1
 
@@ -27,23 +35,36 @@ class SessionMap:
         if cls._instance is None:
             cls._instance = super(SessionMap, cls).__new__(cls)
             cls._instance.expires_in = expires_in
+            cls._instance._lock = threading.Lock()
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:
-        """save new session for later"""
-        self.session_map[session_id] = (datetime.now(), llm)
+        """Save new session for later."""
+        with self._lock:
+            self.session_map[session_id] = (datetime.now(), llm)
 
     def is_expired(self, session_id: str) -> bool:
-        """check if the session is expired"""
-        return (datetime.now() - self.session_map[session_id][0]).total_seconds() > self.expires_in
+        """Check if the session is expired.
+
+        Returns True (treat as expired) when session_id is not yet registered
+        so that callers trigger a fresh token acquisition rather than raising
+        a KeyError.
+        """
+        with self._lock:
+            if session_id not in self.session_map:
+                return True
+            return (
+                datetime.now() - self.session_map[session_id][0]
+            ).total_seconds() > self.expires_in
 
     def get_llm(self, session_id: str) -> LLMResult:
-        """get the LLM instance from the session"""
-        return self.session_map[session_id][1]
+        """Get the LLM instance from the session."""
+        with self._lock:
+            return self.session_map[session_id][1]
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:
-        """generate a uuid from the config"""
+        """Generate a UUID from the config."""
         env_id_key = None
         env_secret_key = None
         if model_config.eas:

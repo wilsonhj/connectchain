@@ -9,10 +9,11 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
-"""Unit testing for PortableOrchestrator class"""
+"""Unit testing for PortableOrchestrator class — BUG-3 regression suite"""
+import asyncio
 import os
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from langchain_openai import ChatOpenAI
 
@@ -40,45 +41,63 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch("connectchain.lcel.model.SessionMap.uuid_from_config", return_value="TEST_MODEL_ENV")
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
-    # pylint: disable=unused-argument
-    def test_build_and_model_with_default_llm(self, mock_get_token, *args):
-        """Test that a PortableOrchestrator instance can be built with the default LLM"""
+    def test_build_and_model_with_default_llm(self, mock_get_token, *args):  # pylint: disable=unused-argument
+        """PortableOrchestrator can be built with the default LLM."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        # pylint: disable=protected-access
-        self.assertEqual(orchestrator._is_lcel, False)
+        self.assertEqual(orchestrator._is_lcel, False)  # pylint: disable=protected-access
         self.mock_from_env.assert_called_once()
         mock_get_token.assert_called_once()
         self.mock_chat_openai.assert_called_once()
         PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        # second call should not invoke ChatOpenAI as it takes it
-        # from cache. hence still only called once
-        self.mock_chat_openai.assert_called_once()
+        self.mock_chat_openai.assert_called_once()  # second call uses cache
 
     @patch.dict(os.environ, {"CONFIG_PATH": "test_path"})
     def test_build_with_missing_config(self, *args):  # pylint: disable=unused-argument
-        """Test that an exception is raised when an unsupported LLM is passed in"""
-        with self.assertRaisesRegex(
-            BaseException, 'Model config at index "gpt5" is not defined'
-        ) as _:
+        """Missing model index raises a descriptive exception."""
+        with self.assertRaisesRegex(BaseException, 'Model config at index "gpt5" is not defined'):
             PortableOrchestrator.from_prompt_template("test_template", ["var1"], index="gpt5")
 
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path"})
     def test_build_with_unsupported_llm(self, *args):  # pylint: disable=unused-argument
-        """Test that an exception is raised when an unsupported LLM is passed in"""
-        with self.assertRaisesRegex(
-            BaseException, 'Model config at index "gpt5" is not defined'
-        ) as _:
+        """Unsupported model index raises a descriptive exception."""
+        with self.assertRaisesRegex(BaseException, 'Model config at index "gpt5" is not defined'):
             PortableOrchestrator.from_prompt_template("test_template", ["var1"], index="gpt5")
+
+    # ── BUG-3 FIX: run_sync must call .invoke(), not deprecated .run() ──────
 
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
-    # pylint: disable=unused-argument
-    def test_run_sync(self, *args):
-        """Test that a PortableOrchestrator instance can be built with the default model config index"""
+    def test_run_sync_uses_invoke(self, *args):  # pylint: disable=unused-argument
+        """run_sync() must call .invoke() with a dict input, not deprecated .run()."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        # pylint: disable=protected-access
-        orchestrator._chain.run.return_value = "test_response"
+        orchestrator._chain.invoke = Mock(return_value={"text": "invoke_response"})  # pylint: disable=protected-access
         response = orchestrator.run_sync("test_query")
-        self.assertEqual(response, "test_response")
+        orchestrator._chain.invoke.assert_called_once_with({"input": "test_query"})  # pylint: disable=protected-access
+        self.assertEqual(response, "invoke_response")
+
+    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
+    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
+    @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
+    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
+    def test_run_sync_output_key_fallback(self, *args):  # pylint: disable=unused-argument
+        """run_sync() handles chains that return 'output' key instead of 'text'."""
+        orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
+        orchestrator._chain.invoke = Mock(return_value={"output": "output_key_response"})  # pylint: disable=protected-access
+        response = orchestrator.run_sync("test_query")
+        self.assertEqual(response, "output_key_response")
+
+    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
+    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
+    @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
+    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
+    def test_run_async_uses_ainvoke(self, *args):  # pylint: disable=unused-argument
+        """async run() must call .ainvoke() with a dict input, not deprecated .arun()."""
+        orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
+        orchestrator._chain.ainvoke = AsyncMock(return_value={"text": "async_response"})  # pylint: disable=protected-access
+        response = asyncio.get_event_loop().run_until_complete(
+            orchestrator.run("async_query")
+        )
+        orchestrator._chain.ainvoke.assert_called_once_with({"input": "async_query"})  # pylint: disable=protected-access
+        self.assertEqual(response, "async_response")
