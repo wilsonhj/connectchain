@@ -68,6 +68,43 @@ class TestPortableOrchestrator(unittest.TestCase):
         with self.assertRaisesRegex(BaseException, 'Model config at index "gpt5" is not defined'):
             PortableOrchestrator.from_prompt_template("test_template", ["var1"], index="gpt5")
 
+    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
+    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
+    @patch("connectchain.lcel.model.SessionMap.uuid_from_config", return_value="TEST_MODEL_ENV")
+    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
+    def test_from_prompt_template_wires_output_sanitizer(
+        self, *args
+    ):  # pylint: disable=unused-argument
+        """CODE-REVIEW FOLLOWUP regression: from_prompt_template() used to
+        hardcode output_sanitizer=None on the ValidLLMChain it builds, so the
+        documented factory method had no way to attach a response sanitizer at
+        all -- only prompt_sanitizer (the input side) was wired up. An
+        output_sanitizer kwarg must now reach the built chain."""
+
+        def my_sanitizer(text: str) -> str:
+            return f"[SANITIZED:{text}]"
+
+        with patch("connectchain.chains.ValidLLMChain") as mock_chain_cls:
+            PortableOrchestrator.from_prompt_template(
+                "test_template", ["var1"], output_sanitizer=my_sanitizer
+            )
+            mock_chain_cls.assert_called_once()
+            self.assertIs(mock_chain_cls.call_args.kwargs["output_sanitizer"], my_sanitizer)
+
+    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
+    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
+    @patch("connectchain.lcel.model.SessionMap.uuid_from_config", return_value="TEST_MODEL_ENV")
+    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
+    def test_from_prompt_template_defaults_output_sanitizer_to_none(
+        self, *args
+    ):  # pylint: disable=unused-argument
+        """Without an explicit output_sanitizer kwarg, the built chain still
+        gets output_sanitizer=None (unchanged default behavior)."""
+        with patch("connectchain.chains.ValidLLMChain") as mock_chain_cls:
+            PortableOrchestrator.from_prompt_template("test_template", ["var1"])
+            mock_chain_cls.assert_called_once()
+            self.assertIsNone(mock_chain_cls.call_args.kwargs["output_sanitizer"])
+
     # ── BUG-3 FIX: run_sync must call .invoke(), not deprecated .run() ──────
 
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")

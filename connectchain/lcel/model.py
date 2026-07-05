@@ -139,12 +139,11 @@ def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
 def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     """Get a direct API model instance for any provider without EAS authentication.
 
-    BUG-4 FIX: Replaced bare `pass` in the except block with structured
-    logging.  ImportError and ValueError are expected fallback conditions
-    (missing provider package or bad model name) and emit a WARNING before
-    falling through to the manual provider init.  All other exceptions are
-    unexpected and are re-raised as LCELModelException with the original
-    traceback preserved via `raise ... from e`.
+    ImportError and ValueError from init_chat_model() are expected fallback
+    conditions (missing provider package or bad model name): logged as a
+    warning, then falls through to the manual provider init below. Any other
+    exception is unexpected and is re-raised as LCELModelException with the
+    original traceback preserved via `raise ... from e`.
     """
     try:
         from langchain.chat_models import init_chat_model  # pylint: disable=import-outside-toplevel
@@ -182,14 +181,9 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
 
     # ── Manual provider-specific initialisation fallback ──────────────────────
     if model_config.provider not in _SUPPORTED_PROVIDERS:
-        # SYSTEMATIC-DEBUGGING FIX: previously the API-key lookup below ran
-        # unconditionally for *any* provider, including unsupported ones. An
-        # unsupported provider like "meta" would fail with a misleading
-        # "API key not found in environment variable: META_API_KEY" error
-        # instead of the intended "not supported" message — because this
-        # provider-support check used to live only in the trailing `else`
-        # branch, after the API-key check had already raised. Checking
-        # provider support first restores the intended fail-fast behaviour.
+        # Check provider support before the API-key lookup below, so an
+        # unsupported provider fails fast with a clear message instead of a
+        # misleading "API key not found" error for a key it never needed.
         raise LCELModelException(
             f"Provider '{model_config.provider}' not supported. "
             f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
@@ -285,5 +279,6 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 "langchain-huggingface not installed. Run: pip install langchain-huggingface"
             ) from exc
 
-    # Unreachable: satisfies mypy — every _SUPPORTED_PROVIDERS branch above returns or raises.
+    # Defensive: fires only if a provider is added to _SUPPORTED_PROVIDERS without a
+    # matching branch above; also satisfies mypy's non-exhaustive-return check.
     raise LCELModelException(f"No initialisation branch for provider '{model_config.provider}'")

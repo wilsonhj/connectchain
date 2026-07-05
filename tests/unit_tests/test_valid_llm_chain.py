@@ -123,3 +123,42 @@ class TestValidLLMChain(TestCase):
         mock_super_run.assert_called_once_with(
             "query", callbacks=None, tags=None, metadata=None, include_run_info=True
         )
+
+    def test_run_forwards_all_positional_args(self):
+        """External-review regression: run() used to hardcode super().run(args[0], ...),
+        silently dropping any positional args beyond the first instead of forwarding
+        them (and letting Chain.run()'s own "only one positional argument" validation
+        apply, as it does on the base class)."""
+        chain = self._make_chain(sanitizer=None)
+        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
+            chain.run("query", "extra_positional")
+        mock_super_run.assert_called_once_with(
+            "query", "extra_positional", callbacks=None, tags=None, metadata=None
+        )
+
+    def test_run_kwargs_only_multi_input_does_not_crash(self):
+        """External-review regression: hardcoding args[0] crashed with IndexError
+        on the kwargs-only multi-input calling convention (chain.run(key1=val1,
+        key2=val2)), since that path is called with zero positional args. This is
+        the ONLY way Chain.run() supports multi-input chains -- multiple positional
+        args are explicitly rejected by Chain.run() itself."""
+        chain = self._make_chain(sanitizer=None)
+        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
+            result = chain.run(rare_bird_type="Streak-backed Oriole")
+        mock_super_run.assert_called_once_with(
+            callbacks=None, tags=None, metadata=None, rare_bird_type="Streak-backed Oriole"
+        )
+        self.assertEqual(result, "raw")
+
+    def test_sanitize_dict_logs_warning_when_output_key_missing(self):
+        """When output_sanitizer is set but output_key isn't in the result dict,
+        _sanitize_dict must log a warning rather than silently no-op -- an
+        unlogged skip here would reintroduce an unsanitized-output bypass with
+        no visible trace."""
+        chain = self._make_chain()
+        with self.assertLogs("connectchain.chains.valid_llm_chain", level="WARNING") as cm:
+            result = chain._sanitize_dict(  # pylint: disable=protected-access
+                {"unexpected_key": "value"}
+            )
+        self.assertEqual(result, {"unexpected_key": "value"})
+        self.assertTrue(any("output_sanitizer is set but output_key" in msg for msg in cm.output))

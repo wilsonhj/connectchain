@@ -14,28 +14,25 @@ This module contains the ValidLLMChain class, which is a subclass of LLMChain.
 In addition, it has a callback for sanitizing the output.
 """
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain.callbacks.base import Callbacks
 from langchain.chains.llm import LLMChain
 from langchain_core.runnables import RunnableConfig
 
+logger = logging.getLogger(__name__)
+
 
 class ValidLLMChain(LLMChain):
     # pylint: disable=too-few-public-methods
     """
-    Extension to LLMChain that sanitizes the **output** if provided with a
-    sanitizer function.  The sanitizer is intentionally applied *after* the
-    LLM call so that it can inspect or transform the model response — not
-    the user's raw input.
+    Extension to LLMChain that sanitizes the model response if an
+    output_sanitizer callable is provided.
 
-    REVIEW-FOLLOWUP FIX: The BUG-1 fix in PR #7 only overrode the legacy
-    run()/arun() methods. PortableOrchestrator's BUG-3 fix in the same PR
-    switched to calling .invoke()/.ainvoke() directly, which does NOT route
-    through run()/arun() — so the sanitizer was silently skipped for every
-    call made through PortableOrchestrator (the intended entry point). This
-    adds invoke()/ainvoke() overrides so the sanitizer applies on both the
-    legacy and LCEL call paths.
+    The sanitizer is applied *after* the LLM call, on all four dispatch
+    paths: run(), arun(), invoke(), and ainvoke(). It is intentionally NOT
+    applied to the user's input.
     """
 
     output_sanitizer: Optional[Callable[[str], str]]
@@ -50,12 +47,12 @@ class ValidLLMChain(LLMChain):
     ) -> Any:
         """Run the chain and sanitize the LLM *response* before returning.
 
-        BUG-1 FIX: Previously the sanitizer was applied to args[0] (the user
-        query) before calling super().run(), meaning the actual model output
-        was never sanitized.  The fix calls super().run() first and passes the
-        result through the sanitizer.
+        *args and **kwargs are forwarded to Chain.run() unmodified so its
+        own input validation and the kwargs-only calling convention for
+        multi-input chains (chain.run(key1=val1, key2=val2)) behave exactly
+        as they do on the base class.
         """
-        result = super().run(args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
+        result = super().run(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
         return self._sanitize(result)
 
     async def arun(
@@ -66,13 +63,11 @@ class ValidLLMChain(LLMChain):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Async variant — sanitize the LLM *response* before returning.
-
-        BUG-1 FIX (async): Without this override the output_sanitizer is
-        silently skipped on all async invocations.
+        """Async variant of run() — sanitize the LLM *response* before returning.
+        See run() for why *args/**kwargs are forwarded unmodified.
         """
         result = await super().arun(
-            args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs
+            *args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs
         )
         return self._sanitize(result)
 
@@ -84,14 +79,9 @@ class ValidLLMChain(LLMChain):
     ) -> Dict[str, Any]:
         """LCEL entry point — sanitize the LLM *response* before returning.
 
-        REVIEW-FOLLOWUP FIX: Callers that use the modern .invoke() API (e.g.
-        PortableOrchestrator after its BUG-3 fix) bypassed run()'s sanitizer
-        entirely, since Chain.invoke() calls self._call() directly and does
-        not route through run(). This override closes that gap.
-
         `input` is typed Any (not Dict) because Chain.invoke() accepts a bare
         value for single-input chains too -- Chain.prep_inputs() maps it onto
-        the chain's own input key, same as run()/arun() do via args[0].
+        the chain's own input key, same as run() does via *args.
         """
         result = super().invoke(input, config=config, **kwargs)
         return self._sanitize_dict(result)
@@ -102,11 +92,7 @@ class ValidLLMChain(LLMChain):
         config: Optional[RunnableConfig] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Async LCEL entry point — sanitize the LLM *response* before returning.
-
-        REVIEW-FOLLOWUP FIX (async): Without this override the sanitizer is
-        silently skipped for every async call made through .ainvoke().
-        """
+        """Async variant of invoke() — sanitize the LLM *response* before returning."""
         result = await super().ainvoke(input, config=config, **kwargs)
         return self._sanitize_dict(result)
 
@@ -115,7 +101,21 @@ class ValidLLMChain(LLMChain):
         return self.output_sanitizer(result) if self.output_sanitizer else result
 
     def _sanitize_dict(self, result: Any) -> Any:
-        """Apply output_sanitizer to result[self.output_key] in place, if configured."""
-        if self.output_sanitizer and isinstance(result, dict) and self.output_key in result:
+        """Apply output_sanitizer to result[self.output_key] in place, if configured.
+
+        Logs a warning rather than silently no-op'ing when output_sanitizer
+        is set but output_key isn't present in result (a downstream chain
+        override or key mismatch), since an unlogged skip here would be an
+        unsanitized-output bypass with no visible trace.
+        """
+        if not self.output_sanitizer:
+            return result
+        if isinstance(result, dict) and self.output_key in result:
             result[self.output_key] = self.output_sanitizer(result[self.output_key])
+        else:
+            logger.warning(
+                "output_sanitizer is set but output_key '%s' not found in result: %s",
+                self.output_key,
+                list(result.keys()) if isinstance(result, dict) else type(result),
+            )
         return result

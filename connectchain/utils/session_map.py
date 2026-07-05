@@ -18,20 +18,13 @@ from langchain.schema import LLMResult
 
 
 class SessionMap:
-    """This class is used to keep track of the session expiration time.
+    """Singleton tracking session expiration time for cached LLM instances.
 
-    BUG-2 FIX: Added existence guard in is_expired() to prevent KeyError when
-    a session_id has not yet been registered (returns True so callers trigger
-    a token refresh).  A threading.Lock() protects all read/write operations
-    to avoid race conditions under concurrent async load.
-
-    CODE-REVIEW FOLLOWUP FIX: __new__'s singleton construction was itself an
-    unguarded check-then-act race (two threads could both pass `cls._instance
-    is None` and both construct/assign before either finished), despite this
-    docstring's claim of full thread-safety. _instance_lock -- a class-level
-    lock that always exists, unlike the instance-level self._lock which isn't
-    created until construction completes -- now guards first construction via
-    double-checked locking.
+    is_expired()/get_llm()/get_valid_llm() return/raise safely for an
+    unregistered session_id rather than raising KeyError (get_llm() is the
+    one exception -- see its docstring). _instance_lock guards first
+    construction via double-checked locking; self._lock (created once
+    construction completes) guards all session_map reads/writes.
     """
 
     _instance: Optional["SessionMap"] = None
@@ -74,14 +67,19 @@ class SessionMap:
             return entry is None or self._is_stale(entry[0])
 
     def get_llm(self, session_id: str) -> LLMResult:
-        """Get the LLM instance from the session."""
+        """Get the LLM instance from the session.
+
+        Precondition: caller must confirm is_expired(session_id) returns
+        False first (or use get_valid_llm() instead, which does this
+        atomically). Raises KeyError if session_id is not registered.
+        """
         with self._lock:
             return self.session_map[session_id][1]
 
     def get_valid_llm(self, session_id: str) -> Optional[LLMResult]:
         """Return the cached LLM for session_id if it exists and is not expired,
-        else None. Combines the is_expired()+get_llm() check-then-act into a
-        single locked operation instead of two, closing the gap between them."""
+        else None. Checks existence and expiry atomically under one lock
+        acquisition, unlike calling is_expired() then get_llm() separately."""
         with self._lock:
             entry = self.session_map.get(session_id)
             if entry is None or self._is_stale(entry[0]):
