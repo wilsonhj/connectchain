@@ -103,3 +103,35 @@ class TestSessionMap(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [], f"Race condition detected: {errors}")
+
+    def test_concurrent_first_construction_yields_single_consistent_instance(self):
+        """CODE-REVIEW FOLLOWUP regression: __new__'s singleton construction was
+        an unguarded check-then-act race -- many threads calling SessionMap(...)
+        for the very first time simultaneously could each construct their own
+        instance/lock and race to assign cls._instance, potentially returning
+        different instances (or an instance whose expires_in came from a
+        different thread's call) to different callers. All threads here race
+        to construct the singleton for the first time with distinct expires_in
+        values; every caller must get back the exact same instance."""
+        results: list = []
+        errors: list = []
+
+        def worker(expires_in: int) -> None:
+            try:
+                results.append(SessionMap(expires_in=expires_in))
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,)) for i in range(100, 100 + 20)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], f"Errors during construction: {errors}")
+        self.assertEqual(len(results), 20)
+        self.assertTrue(
+            all(instance is results[0] for instance in results),
+            "Concurrent first construction returned more than one distinct instance",
+        )

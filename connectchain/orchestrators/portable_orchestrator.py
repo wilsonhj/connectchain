@@ -29,8 +29,19 @@ class PortableOrchestrator:
     BUG-3 FIX: run_sync() and run() previously called the deprecated
     LLMChain.run() / LLMChain.arun() methods which are scheduled for removal
     in LangChain 0.4.x.  Both methods now use the LCEL .invoke() / .ainvoke()
-    API instead.  A key-fallback ('text' then 'output') ensures compatibility
-    with chains that use either output key.
+    API instead.
+
+    CODE-REVIEW FOLLOWUP FIX: The BUG-3 fix above passed a hardcoded
+    {"input": query} dict to .invoke()/.ainvoke(). Unlike the old .run(query),
+    which auto-maps a single positional value onto the chain's real (sole)
+    input key via Chain.prep_inputs(), a dict passed to .invoke() is used
+    as-is -- so "input" had to exactly match the prompt's declared
+    input_variables, which it essentially never does. This broke every real
+    (non-mocked) chain, including the README's own usage example. query is
+    now passed through unwrapped so Chain.prep_inputs() maps it exactly as
+    .run() used to: onto the chain's own input key when query is a bare
+    value, or used as-is when the caller passes a pre-built dict for a
+    multi-input chain.
     """
 
     def __init__(self, chain: connectchain.chains.ValidLLMChain, **kvargs: Any) -> None:
@@ -60,33 +71,31 @@ class PortableOrchestrator:
         chain = connectchain.chains.ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None)
         return PortableOrchestrator(chain)
 
-    def run_sync(self, query: str) -> Any:
+    def run_sync(self, query: Any) -> Any:
         """Run the chain synchronously via LCEL .invoke()."""
-        result = self._chain.invoke({"input": query})
+        result = self._chain.invoke(query)
         return self._extract_output(result)
 
-    async def run(self, query: str) -> Any:
+    async def run(self, query: Any) -> Any:
         """Run the chain asynchronously via LCEL .ainvoke()."""
-        result = await self._chain.ainvoke({"input": query})
+        result = await self._chain.ainvoke(query)
         return self._extract_output(result)
 
-    @staticmethod
-    def _extract_output(result: Any) -> Any:
+    def _extract_output(self, result: Any) -> Any:
         """Pull the response text out of a chain's output dict.
 
-        PR-7-FOLLOWUP FIX: `result.get("text") or result.get("output") or
-        str(result)` treated a legitimate but falsy value (e.g. an empty-string
-        completion) as if the key were absent, silently returning the
-        stringified dict instead of the real response. Checking key presence
-        directly avoids that.
+        CODE-REVIEW FOLLOWUP FIX: This used to hardcode a "text" then "output"
+        key fallback, which silently mishandled any chain built with a custom
+        output_key (a first-class LLMChain constructor arg) -- the real key
+        would never match either guess, so the response fell through to
+        str(result). Reading self._chain.output_key (default "text") targets
+        the chain's actual output key instead of guessing.
         """
         if isinstance(result, dict):
+            output_key = getattr(self._chain, "output_key", "text")
             missing = object()
-            text = result.get("text", missing)
-            if text is not missing:
-                return text
-            output = result.get("output", missing)
-            if output is not missing:
-                return output
+            value = result.get(output_key, missing)
+            if value is not missing:
+                return value
             return str(result)
         return result

@@ -24,24 +24,43 @@ class SessionMap:
     a session_id has not yet been registered (returns True so callers trigger
     a token refresh).  A threading.Lock() protects all read/write operations
     to avoid race conditions under concurrent async load.
+
+    CODE-REVIEW FOLLOWUP FIX: __new__'s singleton construction was itself an
+    unguarded check-then-act race (two threads could both pass `cls._instance
+    is None` and both construct/assign before either finished), despite this
+    docstring's claim of full thread-safety. _instance_lock -- a class-level
+    lock that always exists, unlike the instance-level self._lock which isn't
+    created until construction completes -- now guards first construction via
+    double-checked locking.
     """
 
     _instance: Optional["SessionMap"] = None
+    _instance_lock: threading.Lock = threading.Lock()
     _lock: threading.Lock
     session_map: Dict[str, Tuple[datetime, LLMResult]] = {}
     expires_in: int = -1
 
     def __new__(cls, expires_in: int = 900) -> "SessionMap":
         if cls._instance is None:
-            cls._instance = super(SessionMap, cls).__new__(cls)
-            cls._instance.expires_in = expires_in
-            cls._instance._lock = threading.Lock()
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super(SessionMap, cls).__new__(cls)
+                    cls._instance.expires_in = expires_in
+                    cls._instance._lock = threading.Lock()
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:
         """Save new session for later."""
         with self._lock:
             self.session_map[session_id] = (datetime.now(), llm)
+
+    def _is_stale(self, timestamp: datetime) -> bool:
+        """Whether a cached entry's timestamp has exceeded expires_in.
+
+        Caller must hold self._lock. Shared by is_expired() and
+        get_valid_llm() so the staleness rule lives in exactly one place.
+        """
+        return (datetime.now() - timestamp).total_seconds() > self.expires_in
 
     def is_expired(self, session_id: str) -> bool:
         """Check if the session is expired.
@@ -51,11 +70,8 @@ class SessionMap:
         a KeyError.
         """
         with self._lock:
-            if session_id not in self.session_map:
-                return True
-            return (
-                datetime.now() - self.session_map[session_id][0]
-            ).total_seconds() > self.expires_in
+            entry = self.session_map.get(session_id)
+            return entry is None or self._is_stale(entry[0])
 
     def get_llm(self, session_id: str) -> LLMResult:
         """Get the LLM instance from the session."""
@@ -67,12 +83,10 @@ class SessionMap:
         else None. Combines the is_expired()+get_llm() check-then-act into a
         single locked operation instead of two, closing the gap between them."""
         with self._lock:
-            if session_id not in self.session_map:
+            entry = self.session_map.get(session_id)
+            if entry is None or self._is_stale(entry[0]):
                 return None
-            timestamp, llm = self.session_map[session_id]
-            if (datetime.now() - timestamp).total_seconds() > self.expires_in:
-                return None
-            return llm
+            return entry[1]
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:

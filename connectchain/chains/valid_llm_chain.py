@@ -78,7 +78,7 @@ class ValidLLMChain(LLMChain):
 
     def invoke(
         self,
-        input: Dict[str, Any],  # pylint: disable=redefined-builtin
+        input: Any,  # pylint: disable=redefined-builtin
         config: Optional[RunnableConfig] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -88,13 +88,17 @@ class ValidLLMChain(LLMChain):
         PortableOrchestrator after its BUG-3 fix) bypassed run()'s sanitizer
         entirely, since Chain.invoke() calls self._call() directly and does
         not route through run(). This override closes that gap.
+
+        `input` is typed Any (not Dict) because Chain.invoke() accepts a bare
+        value for single-input chains too -- Chain.prep_inputs() maps it onto
+        the chain's own input key, same as run()/arun() do via args[0].
         """
         result = super().invoke(input, config=config, **kwargs)
         return self._sanitize_dict(result)
 
     async def ainvoke(
         self,
-        input: Dict[str, Any],  # pylint: disable=redefined-builtin
+        input: Any,  # pylint: disable=redefined-builtin
         config: Optional[RunnableConfig] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:

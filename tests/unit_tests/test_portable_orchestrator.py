@@ -16,6 +16,7 @@ import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 from connectchain.chains import ValidLLMChain
@@ -73,28 +74,66 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
-    def test_run_sync_output_extraction(self, *args):  # pylint: disable=unused-argument
-        """run_sync() must call .invoke() with a dict input (not deprecated .run()),
-        and extract "text" or "output" from the result dict -- including when the
-        value is a legitimate falsy empty string. PR-7-FOLLOWUP regression: the
-        prior `result.get("text") or result.get("output") or str(result)` treated
-        an empty-string completion as if the key were absent, returning the
-        stringified dict instead of the real (empty) response."""
-        cases = [
-            ({"text": "invoke_response"}, "invoke_response"),
-            ({"output": "output_key_response"}, "output_key_response"),
-            ({"text": ""}, ""),
-        ]
+    def test_run_sync_passes_query_unwrapped(self, *args):  # pylint: disable=unused-argument
+        """CODE-REVIEW FOLLOWUP regression: run_sync() must pass query straight
+        through to .invoke(), NOT wrapped in {"input": query}. A dict is used
+        as-is by Chain.prep_inputs(), so the literal key "input" would have to
+        match the prompt's declared input_variables -- which it essentially
+        never does for a real (non-mocked) chain. Passing the bare value lets
+        Chain.prep_inputs() map it onto the chain's real input key, exactly
+        like the old (deprecated) .run(query) did."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        for return_value, expected in cases:
-            with self.subTest(return_value=return_value):
-                orchestrator._chain.invoke = Mock(
-                    return_value=return_value
-                )  # pylint: disable=protected-access
-                response = orchestrator.run_sync("test_query")
-                orchestrator._chain.invoke.assert_called_once_with(
-                    {"input": "test_query"}
-                )  # pylint: disable=protected-access
+        orchestrator._chain.invoke = Mock(
+            return_value={"text": "invoke_response"}
+        )  # pylint: disable=protected-access
+        response = orchestrator.run_sync("test_query")
+        orchestrator._chain.invoke.assert_called_once_with(
+            "test_query"
+        )  # pylint: disable=protected-access
+        self.assertEqual(response, "invoke_response")
+
+    def test_run_sync_against_real_chain_with_named_variable(self):
+        """CODE-REVIEW FOLLOWUP regression: reproduces the exact failure from the
+        README's own usage example against the REAL (non-mocked) ValidLLMChain/
+        PromptTemplate classes. Before the fix, .invoke({"input": query}) raised
+        `ValueError: Missing some input keys: {'area_of_interest'}` for any
+        prompt whose variable isn't literally named "input"."""
+        prompt = ValidPromptTemplate(
+            output_sanitizer=lambda x: x,
+            input_variables=["area_of_interest"],
+            template="Tell me about the climate in {area_of_interest}.",
+        )
+        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
+        chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None)
+        orchestrator = PortableOrchestrator(chain)
+        with patch.object(ValidLLMChain, "invoke", return_value={"text": "It's warm."}):
+            response = orchestrator.run_sync("Peru")
+        self.assertEqual(response, "It's warm.")
+
+    def test_run_sync_output_extraction(self):
+        """run_sync() must extract the chain's actual output_key from the result
+        dict -- including when the value is a legitimate falsy empty string.
+        PR-7-FOLLOWUP regression: the prior `result.get("text") or
+        result.get("output") or str(result)` treated an empty-string completion
+        as if the key were absent, returning the stringified dict instead of
+        the real (empty) response. CODE-REVIEW FOLLOWUP regression: a hardcoded
+        "text"/"output" guess (instead of reading the chain's real output_key)
+        silently mishandled any chain with a custom output_key."""
+        prompt = PromptTemplate(input_variables=["q"], template="{q}")
+        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
+        cases = [
+            ("text", {"text": "invoke_response"}, "invoke_response"),
+            ("output", {"output": "output_key_response"}, "output_key_response"),
+            ("text", {"text": ""}, ""),
+        ]
+        for output_key, return_value, expected in cases:
+            with self.subTest(output_key=output_key):
+                chain = ValidLLMChain(
+                    llm=llm, prompt=prompt, output_sanitizer=None, output_key=output_key
+                )
+                orchestrator = PortableOrchestrator(chain)
+                with patch.object(ValidLLMChain, "invoke", return_value=return_value):
+                    response = orchestrator.run_sync("test_query")
                 self.assertEqual(response, expected)
 
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
@@ -102,13 +141,14 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
     def test_run_async_uses_ainvoke(self, *args):  # pylint: disable=unused-argument
-        """async run() must call .ainvoke() with a dict input, not deprecated .arun()."""
+        """async run() must call .ainvoke() with query passed through unwrapped,
+        not deprecated .arun(), and not wrapped in {"input": query}."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
         orchestrator._chain.ainvoke = AsyncMock(
             return_value={"text": "async_response"}
         )  # pylint: disable=protected-access
         response = asyncio.run(orchestrator.run("async_query"))
         orchestrator._chain.ainvoke.assert_called_once_with(
-            {"input": "async_query"}
+            "async_query"
         )  # pylint: disable=protected-access
         self.assertEqual(response, "async_response")
