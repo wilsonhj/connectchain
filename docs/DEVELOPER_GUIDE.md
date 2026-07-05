@@ -37,18 +37,17 @@ cp connectchain/config/example.config.yml config.yml
 
 # 5. Run the test suite to verify setup
 make test
-# Expected: 36 tests pass
+# All tests should pass
 ```
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CONNECTCHAIN_CONFIG_PATH` | ✅ | Absolute path to your `config.yml` |
+| `CONFIG_PATH` | Yes | Absolute path to your `config.yml` (read by `connectchain.utils.Config.from_env()`) |
 | `OPENAI_API_KEY` | For direct access | OpenAI API key |
-| `EAS_ID_KEY` | For EAS auth | EAS client ID env key name |
-| `EAS_SECRET_KEY` | For EAS auth | EAS client secret env key name |
-| `HTTPS_PROXY` | Optional | Outbound proxy URL |
+| *(name set by `eas.id_key`/`eas.secret_key` in config.yml)* | For EAS auth | EAS credential env vars are **not** fixed names — `config.yml`'s `eas.id_key`/`eas.secret_key` point to whichever env vars you use (see `example.env`'s `CONSUMER_ID1`/`CONSUMER_SECRET1`) |
+| `HTTPS_PROXY` / `REQUESTS_CA_BUNDLE` | Optional | Outbound proxy URL / CA bundle path, see `example.env` |
 
 ---
 
@@ -73,7 +72,7 @@ models:
     cert:
       cert_path: /etc/ssl/certs
       cert_name: corp.crt
-      cert_size: 2048           # Default; BUG-4 fix makes this optional
+      cert_size: 2048           # optional; omitted/falsy skips the downloaded-file size check
 ```
 
 ### Direct Access (No EAS)
@@ -106,11 +105,11 @@ prompt = ValidPromptTemplate(
 )
 ```
 
-> ⚠️ **BUG-2 Note:** `ValidLLMChain.output_sanitizer` currently runs on the *input*, not the output.
-> Until BUG-2 is fixed, use `ValidPromptTemplate` for input sanitization and implement output
-> sanitization manually in your chain callback.
+Note the `ValidPromptTemplate` constructor arg is named `output_sanitizer` too, but it validates
+the *rendered prompt* before it's sent to the LLM — separate from `ValidLLMChain.output_sanitizer`
+below, which validates the LLM's *response*.
 
-### Output Sanitizer (Post-BUG-2 Fix)
+### Output Sanitizer
 
 ```python
 from connectchain.chains import ValidLLMChain
@@ -122,30 +121,40 @@ def redact_output(response: str) -> str:
 chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=redact_output)
 ```
 
+`ValidLLMChain.output_sanitizer` is applied to the LLM's response on all four dispatch paths
+(`run()`, `arun()`, `invoke()`, `ainvoke()`), not to the input. If you build a `PortableOrchestrator`
+via `from_prompt_template(...)`, pass `output_sanitizer=` as a kwarg there to have it forwarded to
+the underlying `ValidLLMChain`.
+
 ---
 
 ## 4. Writing Tests
 
-Tests live in `tests/unit_tests/` and `tests/integration_tests/`. Follow existing patterns:
+Tests live in `tests/unit_tests/` and `tests/integration_tests/` and use `unittest.TestCase` (not
+bare pytest-style classes), matching the rest of the suite:
 
 ```python
 # tests/unit_tests/test_my_sanitizer.py
-import pytest
+# (include the standard Apache 2.0 license header at the top of any new file --
+#  copy it from an existing test file)
+import unittest
+
 from connectchain.utils.exceptions import OperationNotPermittedException
 from mymodule import block_pii
 
-class TestBlockPII:
+
+class TestBlockPII(unittest.TestCase):
     def test_clean_input_passes(self):
         result = block_pii("What is the weather?")
-        assert result == "What is the weather?"
+        self.assertEqual(result, "What is the weather?")
 
     def test_ssn_raises(self):
-        with pytest.raises(OperationNotPermittedException):
+        with self.assertRaises(OperationNotPermittedException):
             block_pii("My SSN is 123-45-6789")
 
     def test_partial_ssn_passes(self):
         result = block_pii("Call 555-1234")
-        assert result == "Call 555-1234"
+        self.assertEqual(result, "Call 555-1234")
 ```
 
 ```bash
@@ -160,29 +169,26 @@ make test-unit-cov
 
 ## 5. Debugging Tips
 
-### BUG-1: KeyError in SessionMap
+### SessionMap first-lookup behavior
 
-```python
-# Reproduce:
-from connectchain.utils import SessionMap
-sm = SessionMap()
-sm.is_expired('1')  # ← KeyError here before fix
+`SessionMap` is a per-process singleton. `is_expired(session_id)` and `get_valid_llm(session_id)`
+both return safely (`True`/`None`) for a `session_id` that was never registered — they do not raise
+`KeyError`. `get_llm(session_id)` is the one exception: it does a raw dict lookup and raises
+`KeyError` if the session isn't registered, so only call it after confirming `is_expired()` is
+`False` (or use `get_valid_llm()`, which does both atomically).
 
-# Workaround until fix is merged:
-try:
-    expired = sm.is_expired('1')
-except KeyError:
-    expired = True  # treat missing session as expired → triggers refresh
-```
+### `LangChainDeprecationWarning` if you see it
 
-### BUG-3: PortableOrchestrator async deprecation warning
+If you're on a version of this codebase or a dependency that still calls a deprecated LangChain API
+directly (`Chain.run()`/`Chain.arun()`), you'll see:
 
 ```
-LangChainDeprecationWarning: The method `LLMChain.arun` was deprecated in
-langchain 0.1.0 and will be removed in 1.0. Use :meth:`~invoke` instead.
+LangChainDeprecationWarning: The method `Chain.run` was deprecated in langchain 0.1.0
+and will be removed in 1.0. Use :meth:`~invoke` instead.
 ```
 
-This is a warning today but will become an error in LangChain 0.4.x. Track: [ROADMAP.md §Fix F-3](ROADMAP.md).
+`PortableOrchestrator` already uses `.invoke()`/`.ainvoke()`, so you shouldn't see this from
+ConnectChain's own code paths on current `main` — if you do, it's worth filing an issue.
 
 ### Verbose LangChain Logging
 
@@ -195,7 +201,7 @@ langchain.debug = True  # Prints full chain inputs/outputs
 
 ```bash
 # Check env var is set
-echo $CONNECTCHAIN_CONFIG_PATH
+echo $CONFIG_PATH
 # Should print absolute path to config.yml
 
 # Validate YAML syntax
@@ -217,7 +223,7 @@ uv run mypy connectchain/
 uv run black connectchain/ tests/
 ```
 
-- Max line length: **120** characters (see `.pylintrc`)
+- Max line length: **100** characters, enforced by black/isort (see `pyproject.toml`); pylint's own limit is 160 (see `.pylintrc`)
 - Docstrings: Google style
 - Type hints: required for all public functions
 
@@ -243,4 +249,4 @@ uv run black connectchain/ tests/
 Fixes #<issue-number>
 ```
 
-PR titles must match the commit convention. Fill out `.github/PULL_REQUEST_TEMPLATE.md` completely before requesting review.
+PR titles must match the commit convention. Fill out `.github/pull_request_template.md` completely before requesting review.
