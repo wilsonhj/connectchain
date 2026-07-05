@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 """Unit testing for PortableOrchestrator class — BUG-3 regression suite"""
+
 import asyncio
 import os
 import unittest
@@ -20,6 +21,7 @@ from langchain_openai import ChatOpenAI
 from connectchain.chains import ValidLLMChain
 from connectchain.orchestrators import PortableOrchestrator
 from connectchain.prompts import ValidPromptTemplate
+
 from .setup_utils import get_mock_config
 
 
@@ -41,7 +43,9 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch("connectchain.lcel.model.SessionMap.uuid_from_config", return_value="TEST_MODEL_ENV")
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
-    def test_build_and_model_with_default_llm(self, mock_get_token, *args):  # pylint: disable=unused-argument
+    def test_build_and_model_with_default_llm(
+        self, mock_get_token, *args
+    ):  # pylint: disable=unused-argument
         """PortableOrchestrator can be built with the default LLM."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
         self.assertEqual(orchestrator._is_lcel, False)  # pylint: disable=protected-access
@@ -72,9 +76,13 @@ class TestPortableOrchestrator(unittest.TestCase):
     def test_run_sync_uses_invoke(self, *args):  # pylint: disable=unused-argument
         """run_sync() must call .invoke() with a dict input, not deprecated .run()."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.invoke = Mock(return_value={"text": "invoke_response"})  # pylint: disable=protected-access
+        orchestrator._chain.invoke = Mock(
+            return_value={"text": "invoke_response"}
+        )  # pylint: disable=protected-access
         response = orchestrator.run_sync("test_query")
-        orchestrator._chain.invoke.assert_called_once_with({"input": "test_query"})  # pylint: disable=protected-access
+        orchestrator._chain.invoke.assert_called_once_with(
+            {"input": "test_query"}
+        )  # pylint: disable=protected-access
         self.assertEqual(response, "invoke_response")
 
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
@@ -84,7 +92,9 @@ class TestPortableOrchestrator(unittest.TestCase):
     def test_run_sync_output_key_fallback(self, *args):  # pylint: disable=unused-argument
         """run_sync() handles chains that return 'output' key instead of 'text'."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.invoke = Mock(return_value={"output": "output_key_response"})  # pylint: disable=protected-access
+        orchestrator._chain.invoke = Mock(
+            return_value={"output": "output_key_response"}
+        )  # pylint: disable=protected-access
         response = orchestrator.run_sync("test_query")
         self.assertEqual(response, "output_key_response")
 
@@ -95,9 +105,11 @@ class TestPortableOrchestrator(unittest.TestCase):
     def test_run_async_uses_ainvoke(self, *args):  # pylint: disable=unused-argument
         """async run() must call .ainvoke() with a dict input, not deprecated .arun()."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.ainvoke = AsyncMock(return_value={"text": "async_response"})  # pylint: disable=protected-access
-        response = asyncio.get_event_loop().run_until_complete(
-            orchestrator.run("async_query")
-        )
-        orchestrator._chain.ainvoke.assert_called_once_with({"input": "async_query"})  # pylint: disable=protected-access
+        orchestrator._chain.ainvoke = AsyncMock(
+            return_value={"text": "async_response"}
+        )  # pylint: disable=protected-access
+        response = asyncio.run(orchestrator.run("async_query"))
+        orchestrator._chain.ainvoke.assert_called_once_with(
+            {"input": "async_query"}
+        )  # pylint: disable=protected-access
         self.assertEqual(response, "async_response")

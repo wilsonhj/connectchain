@@ -13,10 +13,12 @@
 This module contains the ValidLLMChain class, which is a subclass of LLMChain.
 In addition, it has a callback for sanitizing the output.
 """
+
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain.callbacks.base import Callbacks
 from langchain.chains.llm import LLMChain
+from langchain_core.runnables import RunnableConfig
 
 
 class ValidLLMChain(LLMChain):
@@ -26,6 +28,14 @@ class ValidLLMChain(LLMChain):
     sanitizer function.  The sanitizer is intentionally applied *after* the
     LLM call so that it can inspect or transform the model response — not
     the user's raw input.
+
+    REVIEW-FOLLOWUP FIX: The BUG-1 fix in PR #7 only overrode the legacy
+    run()/arun() methods. PortableOrchestrator's BUG-3 fix in the same PR
+    switched to calling .invoke()/.ainvoke() directly, which does NOT route
+    through run()/arun() — so the sanitizer was silently skipped for every
+    call made through PortableOrchestrator (the intended entry point). This
+    adds invoke()/ainvoke() overrides so the sanitizer applies on both the
+    legacy and LCEL call paths.
     """
 
     output_sanitizer: Optional[Callable[[str], str]]
@@ -38,7 +48,6 @@ class ValidLLMChain(LLMChain):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        # pylint: disable=unused-argument
         """Run the chain and sanitize the LLM *response* before returning.
 
         BUG-1 FIX: Previously the sanitizer was applied to args[0] (the user
@@ -46,7 +55,7 @@ class ValidLLMChain(LLMChain):
         was never sanitized.  The fix calls super().run() first and passes the
         result through the sanitizer.
         """
-        result = super().run(args[0], callbacks=callbacks, tags=tags, metadata=metadata)
+        result = super().run(args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
         return self.output_sanitizer(result) if self.output_sanitizer else result
 
     async def arun(
@@ -57,11 +66,46 @@ class ValidLLMChain(LLMChain):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        # pylint: disable=unused-argument
         """Async variant — sanitize the LLM *response* before returning.
 
         BUG-1 FIX (async): Without this override the output_sanitizer is
         silently skipped on all async invocations.
         """
-        result = await super().arun(args[0], callbacks=callbacks, tags=tags, metadata=metadata)
+        result = await super().arun(
+            args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs
+        )
         return self.output_sanitizer(result) if self.output_sanitizer else result
+
+    def invoke(
+        self,
+        input: Dict[str, Any],  # pylint: disable=redefined-builtin
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LCEL entry point — sanitize the LLM *response* before returning.
+
+        REVIEW-FOLLOWUP FIX: Callers that use the modern .invoke() API (e.g.
+        PortableOrchestrator after its BUG-3 fix) bypassed run()'s sanitizer
+        entirely, since Chain.invoke() calls self._call() directly and does
+        not route through run(). This override closes that gap.
+        """
+        result = super().invoke(input, config=config, **kwargs)
+        if self.output_sanitizer and isinstance(result, dict) and self.output_key in result:
+            result[self.output_key] = self.output_sanitizer(result[self.output_key])
+        return result
+
+    async def ainvoke(
+        self,
+        input: Dict[str, Any],  # pylint: disable=redefined-builtin
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Async LCEL entry point — sanitize the LLM *response* before returning.
+
+        REVIEW-FOLLOWUP FIX (async): Without this override the sanitizer is
+        silently skipped for every async call made through .ainvoke().
+        """
+        result = await super().ainvoke(input, config=config, **kwargs)
+        if self.output_sanitizer and isinstance(result, dict) and self.output_key in result:
+            result[self.output_key] = self.output_sanitizer(result[self.output_key])
+        return result

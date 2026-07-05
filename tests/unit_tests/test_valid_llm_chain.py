@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 """Unit Tests for ValidLLMChain — BUG-1 regression suite"""
+
 import asyncio
 from unittest import TestCase
 from unittest.mock import patch
@@ -71,19 +72,58 @@ class TestValidLLMChain(TestCase):
             result = chain.run("anything")
         self.assertEqual(result, "raw LLM response")
 
-    @patch("connectchain.chains.valid_llm_chain.ValidLLMChain.arun")
-    def test_arun_sanitizer_applied_to_output(self, mock_arun):
-        """Async arun() override must also apply the sanitizer to the LLM response."""
-        mock_arun.return_value = asyncio.coroutine(lambda: "[SANITIZED:Async LLM response]")() \
-            if hasattr(asyncio, 'coroutine') \
-            else self._make_coro("[SANITIZED:Async LLM response]")
-        # Use a simple coroutine mock instead
-        import asyncio as _asyncio
+    def test_arun_sanitizer_applied_to_output(self):
+        """Async arun() override must also apply the sanitizer to the LLM response.
 
-        async def fake_arun(*a, **kw):
-            return "[SANITIZED:Async LLM response]"
+        NOTE: The original version of this test tried `chain.arun = fake_arun`, which
+        raises `ValueError: "ValidLLMChain" object has no field "arun"` — ValidLLMChain
+        is a pydantic model and rejects instance attribute assignment for anything not
+        declared as a field (see llm_proxy_wrapper.py's own docstring on this exact
+        pydantic quirk). Patching the parent class's arun() and calling the real
+        chain.arun() exercises the actual sanitizer logic instead.
+        """
+
+        async def fake_super_arun(*a, **kw):  # pylint: disable=unused-argument
+            return "Raw async LLM response"
 
         chain = self._make_chain()
-        chain.arun = fake_arun  # type: ignore[method-assign]
-        result = _asyncio.get_event_loop().run_until_complete(chain.arun("query"))
-        self.assertIn("[SANITIZED:", result)
+        with patch.object(LLMChain, "arun", side_effect=fake_super_arun):
+            result = asyncio.run(chain.arun("query"))
+        self.assertEqual(result, "[SANITIZED:Raw async LLM response]")
+
+    def test_invoke_sanitizer_applied_to_output(self):
+        """REVIEW-FOLLOWUP: .invoke() (the LCEL path PortableOrchestrator uses)
+        must also apply the sanitizer, not just run()/arun()."""
+        chain = self._make_chain()
+        with patch.object(LLMChain, "invoke", return_value={"text": "Raw LLM response"}):
+            result = chain.invoke({"rare_bird_type": "Streak-backed Oriole"})
+        self.assertEqual(result["text"], "[SANITIZED:Raw LLM response]")
+
+    def test_ainvoke_sanitizer_applied_to_output(self):
+        """REVIEW-FOLLOWUP (async): .ainvoke() must also apply the sanitizer."""
+
+        async def fake_super_ainvoke(*a, **kw):  # pylint: disable=unused-argument
+            return {"text": "Raw async LLM response"}
+
+        chain = self._make_chain()
+        with patch.object(LLMChain, "ainvoke", side_effect=fake_super_ainvoke):
+            result = asyncio.run(chain.ainvoke({"rare_bird_type": "Streak-backed Oriole"}))
+        self.assertEqual(result["text"], "[SANITIZED:Raw async LLM response]")
+
+    def test_invoke_no_sanitizer_returns_raw_output(self):
+        """When output_sanitizer is None, .invoke() returns the raw dict unchanged."""
+        prompt = PromptTemplate(input_variables=["q"], template="{q}")
+        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
+        chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None)
+        with patch.object(LLMChain, "invoke", return_value={"text": "raw LLM response"}):
+            result = chain.invoke({"q": "anything"})
+        self.assertEqual(result["text"], "raw LLM response")
+
+    def test_run_passes_through_extra_kwargs(self):
+        """REVIEW-FOLLOWUP: run() must not silently drop caller-supplied **kwargs."""
+        chain = self._make_chain()
+        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
+            chain.run("query", include_run_info=True)
+        mock_super_run.assert_called_once_with(
+            "query", callbacks=None, tags=None, metadata=None, include_run_info=True
+        )
