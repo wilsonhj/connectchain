@@ -176,6 +176,21 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         ) from e
 
     # ── Manual provider-specific initialisation fallback ──────────────────────
+    _supported_providers = ("openai", "anthropic", "google", "cohere", "huggingface")
+    if model_config.provider not in _supported_providers:
+        # SYSTEMATIC-DEBUGGING FIX: previously the API-key lookup below ran
+        # unconditionally for *any* provider, including unsupported ones. An
+        # unsupported provider like "meta" would fail with a misleading
+        # "API key not found in environment variable: META_API_KEY" error
+        # instead of the intended "not supported" message — because this
+        # provider-support check used to live only in the trailing `else`
+        # branch, after the API-key check had already raised. Checking
+        # provider support first restores the intended fail-fast behaviour.
+        raise LCELModelException(
+            f"Provider '{model_config.provider}' not supported. "
+            f"Supported providers: {', '.join(_supported_providers)}"
+        )
+
     api_key_env = getattr(model_config, "api_key_env", None)
     if not api_key_env:
         api_key_env = f"{model_config.provider.upper()}_API_KEY"
@@ -211,6 +226,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     elif model_config.provider == "anthropic":
         try:
             from langchain_anthropic import ChatAnthropic  # pylint: disable=import-outside-toplevel
+
             return ChatAnthropic(
                 model=model_config.model_name,
                 anthropic_api_key=api_key,
@@ -223,7 +239,10 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
 
     elif model_config.provider == "google":
         try:
-            from langchain_google_genai import ChatGoogleGenerativeAI  # pylint: disable=import-outside-toplevel
+            from langchain_google_genai import (  # pylint: disable=import-outside-toplevel
+                ChatGoogleGenerativeAI,
+            )
+
             return ChatGoogleGenerativeAI(
                 model=model_config.model_name,
                 google_api_key=api_key,
@@ -236,6 +255,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     elif model_config.provider == "cohere":
         try:
             from langchain_cohere import ChatCohere  # pylint: disable=import-outside-toplevel
+
             return ChatCohere(
                 model=model_config.model_name,
                 cohere_api_key=api_key,
@@ -247,7 +267,10 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
 
     elif model_config.provider == "huggingface":
         try:
-            from langchain_huggingface import HuggingFaceEndpoint  # pylint: disable=import-outside-toplevel
+            from langchain_huggingface import (  # pylint: disable=import-outside-toplevel
+                HuggingFaceEndpoint,
+            )
+
             return HuggingFaceEndpoint(
                 repo_id=model_config.model_name,
                 huggingfacehub_api_token=api_key,
@@ -258,8 +281,9 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 "langchain-huggingface not installed. Run: pip install langchain-huggingface"
             ) from exc
 
-    else:
-        raise LCELModelException(
-            f"Provider '{model_config.provider}' not supported. "
-            f"Supported providers: openai, anthropic, google, cohere, huggingface"
-        )
+    # Unreachable: the _supported_providers guard above already rejects any
+    # provider not handled by one of the branches. Raising here (rather than
+    # falling off the end or returning None) keeps the BaseLanguageModel
+    # return-type contract intact for mypy and any future providers added
+    # to _supported_providers without a matching branch.
+    raise LCELModelException(f"No initialisation branch for provider '{model_config.provider}'")

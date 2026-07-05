@@ -83,12 +83,18 @@ class TestModel(unittest.TestCase):
             test_model = model("gpt5")
 
     def test_model_with_unsupported_provider(self):
+        """SYSTEMATIC-DEBUGGING FIX: unsupported provider must fail fast with the
+        'not supported' message, not a misleading 'API key not found' error from
+        an unrelated env var that the caller was never going to set. This also
+        fixes a stale assertion: the actual message has always said 'not
+        supported', never 'Not implemented' — the regex could not have matched
+        even if the ordering bug were absent."""
         test_config = get_mock_config()
         # required to not modify dict instance
         test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
         test_config.data["models"]["1"]["provider"] = "meta"
         self.setUpWithConfig(test_config)
-        with self.assertRaisesRegex(LCELModelException, "Not implemented") as _:
+        with self.assertRaisesRegex(LCELModelException, "not supported") as _:
             test_model = model()
 
     @patch("langchain.chat_models.init_chat_model")
