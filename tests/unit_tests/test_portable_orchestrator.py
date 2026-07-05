@@ -102,6 +102,22 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
+    def test_run_sync_returns_empty_string_text(self, *args):  # pylint: disable=unused-argument
+        """PR-7-FOLLOWUP regression: run_sync() used `result.get("text") or
+        result.get("output") or str(result)`. `or` treats a legitimate but falsy
+        value (an empty-string completion) as absent, so it fell through to
+        `str(result)` and returned the stringified dict instead of the real
+        (empty) response. The chain returning "" is valid output, not a missing
+        key, and must be returned as-is."""
+        orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
+        orchestrator._chain.invoke = Mock(return_value={"text": ""})  # pylint: disable=protected-access
+        response = orchestrator.run_sync("test_query")
+        self.assertEqual(response, "")
+
+    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
+    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
+    @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
+    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
     def test_run_async_uses_ainvoke(self, *args):  # pylint: disable=unused-argument
         """async run() must call .ainvoke() with a dict input, not deprecated .arun()."""
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])

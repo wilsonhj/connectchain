@@ -63,13 +63,27 @@ class PortableOrchestrator:
     def run_sync(self, query: str) -> Any:
         """Run the chain synchronously via LCEL .invoke()."""
         result = self._chain.invoke({"input": query})
-        if isinstance(result, dict):
-            return result.get("text") or result.get("output") or str(result)
-        return result
+        return self._extract_output(result)
 
     async def run(self, query: str) -> Any:
         """Run the chain asynchronously via LCEL .ainvoke()."""
         result = await self._chain.ainvoke({"input": query})
+        return self._extract_output(result)
+
+    @staticmethod
+    def _extract_output(result: Any) -> Any:
+        """Pull the response text out of a chain's output dict.
+
+        PR-7-FOLLOWUP FIX: `result.get("text") or result.get("output") or
+        str(result)` treated a legitimate but falsy value (e.g. an empty-string
+        completion) as if the key were absent, silently returning the
+        stringified dict instead of the real response. Checking key presence
+        directly avoids that.
+        """
         if isinstance(result, dict):
-            return result.get("text") or result.get("output") or str(result)
+            if "text" in result:
+                return result["text"]
+            if "output" in result:
+                return result["output"]
+            return str(result)
         return result
