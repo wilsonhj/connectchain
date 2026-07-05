@@ -73,46 +73,29 @@ class TestPortableOrchestrator(unittest.TestCase):
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
     @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
-    def test_run_sync_uses_invoke(self, *args):  # pylint: disable=unused-argument
-        """run_sync() must call .invoke() with a dict input, not deprecated .run()."""
+    def test_run_sync_output_extraction(self, *args):  # pylint: disable=unused-argument
+        """run_sync() must call .invoke() with a dict input (not deprecated .run()),
+        and extract "text" or "output" from the result dict -- including when the
+        value is a legitimate falsy empty string. PR-7-FOLLOWUP regression: the
+        prior `result.get("text") or result.get("output") or str(result)` treated
+        an empty-string completion as if the key were absent, returning the
+        stringified dict instead of the real (empty) response."""
+        cases = [
+            ({"text": "invoke_response"}, "invoke_response"),
+            ({"output": "output_key_response"}, "output_key_response"),
+            ({"text": ""}, ""),
+        ]
         orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.invoke = Mock(
-            return_value={"text": "invoke_response"}
-        )  # pylint: disable=protected-access
-        response = orchestrator.run_sync("test_query")
-        orchestrator._chain.invoke.assert_called_once_with(
-            {"input": "test_query"}
-        )  # pylint: disable=protected-access
-        self.assertEqual(response, "invoke_response")
-
-    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
-    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
-    @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
-    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
-    def test_run_sync_output_key_fallback(self, *args):  # pylint: disable=unused-argument
-        """run_sync() handles chains that return 'output' key instead of 'text'."""
-        orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.invoke = Mock(
-            return_value={"output": "output_key_response"}
-        )  # pylint: disable=protected-access
-        response = orchestrator.run_sync("test_query")
-        self.assertEqual(response, "output_key_response")
-
-    @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
-    @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
-    @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))
-    @patch.dict(os.environ, {"CONFIG_PATH": "any_path", "id_key": "any", "secret_key": "any"})
-    def test_run_sync_returns_empty_string_text(self, *args):  # pylint: disable=unused-argument
-        """PR-7-FOLLOWUP regression: run_sync() used `result.get("text") or
-        result.get("output") or str(result)`. `or` treats a legitimate but falsy
-        value (an empty-string completion) as absent, so it fell through to
-        `str(result)` and returned the stringified dict instead of the real
-        (empty) response. The chain returning "" is valid output, not a missing
-        key, and must be returned as-is."""
-        orchestrator = PortableOrchestrator.from_prompt_template("test_template", ["var1"])
-        orchestrator._chain.invoke = Mock(return_value={"text": ""})  # pylint: disable=protected-access
-        response = orchestrator.run_sync("test_query")
-        self.assertEqual(response, "")
+        for return_value, expected in cases:
+            with self.subTest(return_value=return_value):
+                orchestrator._chain.invoke = Mock(
+                    return_value=return_value
+                )  # pylint: disable=protected-access
+                response = orchestrator.run_sync("test_query")
+                orchestrator._chain.invoke.assert_called_once_with(
+                    {"input": "test_query"}
+                )  # pylint: disable=protected-access
+                self.assertEqual(response, expected)
 
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))

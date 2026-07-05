@@ -56,7 +56,7 @@ class ValidLLMChain(LLMChain):
         result through the sanitizer.
         """
         result = super().run(args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
-        return self.output_sanitizer(result) if self.output_sanitizer else result
+        return self._sanitize(result)
 
     async def arun(
         self,
@@ -74,7 +74,7 @@ class ValidLLMChain(LLMChain):
         result = await super().arun(
             args[0], callbacks=callbacks, tags=tags, metadata=metadata, **kwargs
         )
-        return self.output_sanitizer(result) if self.output_sanitizer else result
+        return self._sanitize(result)
 
     def invoke(
         self,
@@ -90,9 +90,7 @@ class ValidLLMChain(LLMChain):
         not route through run(). This override closes that gap.
         """
         result = super().invoke(input, config=config, **kwargs)
-        if self.output_sanitizer and isinstance(result, dict) and self.output_key in result:
-            result[self.output_key] = self.output_sanitizer(result[self.output_key])
-        return result
+        return self._sanitize_dict(result)
 
     async def ainvoke(
         self,
@@ -106,6 +104,14 @@ class ValidLLMChain(LLMChain):
         silently skipped for every async call made through .ainvoke().
         """
         result = await super().ainvoke(input, config=config, **kwargs)
+        return self._sanitize_dict(result)
+
+    def _sanitize(self, result: Any) -> Any:
+        """Apply output_sanitizer to a plain string result, if configured."""
+        return self.output_sanitizer(result) if self.output_sanitizer else result
+
+    def _sanitize_dict(self, result: Any) -> Any:
+        """Apply output_sanitizer to result[self.output_key] in place, if configured."""
         if self.output_sanitizer and isinstance(result, dict) and self.output_key in result:
             result[self.output_key] = self.output_sanitizer(result[self.output_key])
         return result

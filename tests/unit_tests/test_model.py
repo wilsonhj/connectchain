@@ -105,13 +105,12 @@ class TestModel(unittest.TestCase):
         `except: pass` and left to fall through to manual init."""
         mock_init_chat_model.side_effect = RuntimeError("boom: unexpected failure")
         model_config = wrap_model_config(get_mock_config().data["models"]["1"])
-        with self.assertRaisesRegex(LCELModelException, "Unexpected error initialising model"):
+        with self.assertRaisesRegex(
+            LCELModelException, "Unexpected error initialising model"
+        ) as cm:
             _get_direct_model_(model_config)
         # confirm the original exception is chained, not lost
-        try:
-            _get_direct_model_(model_config)
-        except LCELModelException as exc:
-            self.assertIsInstance(exc.__cause__, RuntimeError)
+        self.assertIsInstance(cm.exception.__cause__, RuntimeError)
 
     @patch("langchain.chat_models.init_chat_model")
     def test_get_direct_model_falls_through_on_expected_exceptions(self, mock_init_chat_model):

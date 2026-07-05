@@ -33,13 +33,13 @@ def my_sanitizer(text: str) -> str:
 class TestValidLLMChain(TestCase):
     """Regression tests for ValidLLMChain"""
 
-    def _make_chain(self) -> ValidLLMChain:
+    def _make_chain(self, sanitizer=my_sanitizer) -> ValidLLMChain:
         prompt = PromptTemplate(
             input_variables=["rare_bird_type"],
             template="Tell me about the rare bird, {rare_bird_type}.",
         )
         llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
-        return ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=my_sanitizer)
+        return ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=sanitizer)
 
     # ── BUG-1 FIX: sanitizer must run on the LLM *response*, not the input ──
 
@@ -65,9 +65,7 @@ class TestValidLLMChain(TestCase):
 
     def test_run_no_sanitizer_returns_raw_output(self):
         """When output_sanitizer is None, the raw LLM response is returned unchanged."""
-        prompt = PromptTemplate(input_variables=["q"], template="{q}")
-        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
-        chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None)
+        chain = self._make_chain(sanitizer=None)
         with patch.object(LLMChain, "run", return_value="raw LLM response"):
             result = chain.run("anything")
         self.assertEqual(result, "raw LLM response")
@@ -112,11 +110,9 @@ class TestValidLLMChain(TestCase):
 
     def test_invoke_no_sanitizer_returns_raw_output(self):
         """When output_sanitizer is None, .invoke() returns the raw dict unchanged."""
-        prompt = PromptTemplate(input_variables=["q"], template="{q}")
-        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
-        chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None)
+        chain = self._make_chain(sanitizer=None)
         with patch.object(LLMChain, "invoke", return_value={"text": "raw LLM response"}):
-            result = chain.invoke({"q": "anything"})
+            result = chain.invoke({"rare_bird_type": "anything"})
         self.assertEqual(result["text"], "raw LLM response")
 
     def test_run_passes_through_extra_kwargs(self):

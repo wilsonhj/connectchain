@@ -23,6 +23,8 @@ from connectchain.utils.llm_proxy_wrapper import wrap_llm_with_proxy
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_PROVIDERS = ("openai", "anthropic", "google", "cohere", "huggingface")
+
 
 class LCELModelException(BaseException):
     """Base exception for the LCEL model"""
@@ -88,18 +90,21 @@ def _get_model_(index: Any) -> BaseLanguageModel:
 def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLanguageModel:
     """Get the OpenAI LLM instance"""
     model_session_key = SessionMap.uuid_from_config(config, model_config)
-    auth_token = os.getenv(model_session_key)
     session_map = SessionMap(config.eas.token_refresh_interval)
-    if auth_token is None or session_map.is_expired(model_session_key):
-        auth_token = get_token_from_env(index)
-        os.environ[model_session_key] = auth_token
-        if model_config.type == "chat":
-            llm: BaseLanguageModel = _get_chat_model_(auth_token, model_config)
-        else:
-            llm = _get_azure_model_(auth_token, model_config)
-        session_map.new_session(model_session_key, llm)  # type: ignore[arg-type]
-        return llm
-    return session_map.get_llm(model_session_key)  # type: ignore[return-value]
+    if os.getenv(model_session_key) is not None:
+        # get_valid_llm() combines the expiry check and cache read into a single
+        # locked operation instead of two (is_expired() then get_llm()).
+        cached_llm = session_map.get_valid_llm(model_session_key)  # type: ignore[assignment]
+        if cached_llm is not None:
+            return cached_llm
+    auth_token = get_token_from_env(index)
+    os.environ[model_session_key] = auth_token
+    if model_config.type == "chat":
+        llm: BaseLanguageModel = _get_chat_model_(auth_token, model_config)
+    else:
+        llm = _get_azure_model_(auth_token, model_config)
+    session_map.new_session(model_session_key, llm)  # type: ignore[arg-type]
+    return llm
 
 
 def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
@@ -176,8 +181,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         ) from e
 
     # ── Manual provider-specific initialisation fallback ──────────────────────
-    _supported_providers = ("openai", "anthropic", "google", "cohere", "huggingface")
-    if model_config.provider not in _supported_providers:
+    if model_config.provider not in _SUPPORTED_PROVIDERS:
         # SYSTEMATIC-DEBUGGING FIX: previously the API-key lookup below ran
         # unconditionally for *any* provider, including unsupported ones. An
         # unsupported provider like "meta" would fail with a misleading
@@ -188,7 +192,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         # provider support first restores the intended fail-fast behaviour.
         raise LCELModelException(
             f"Provider '{model_config.provider}' not supported. "
-            f"Supported providers: {', '.join(_supported_providers)}"
+            f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
         )
 
     api_key_env = getattr(model_config, "api_key_env", None)
@@ -281,9 +285,5 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 "langchain-huggingface not installed. Run: pip install langchain-huggingface"
             ) from exc
 
-    # Unreachable: the _supported_providers guard above already rejects any
-    # provider not handled by one of the branches. Raising here (rather than
-    # falling off the end or returning None) keeps the BaseLanguageModel
-    # return-type contract intact for mypy and any future providers added
-    # to _supported_providers without a matching branch.
+    # Unreachable: satisfies mypy — every _SUPPORTED_PROVIDERS branch above returns or raises.
     raise LCELModelException(f"No initialisation branch for provider '{model_config.provider}'")

@@ -27,7 +27,7 @@ class SessionMap:
     """
 
     _instance: Optional["SessionMap"] = None
-    _lock: threading.Lock = threading.Lock()
+    _lock: threading.Lock
     session_map: Dict[str, Tuple[datetime, LLMResult]] = {}
     expires_in: int = -1
 
@@ -61,6 +61,18 @@ class SessionMap:
         """Get the LLM instance from the session."""
         with self._lock:
             return self.session_map[session_id][1]
+
+    def get_valid_llm(self, session_id: str) -> Optional[LLMResult]:
+        """Return the cached LLM for session_id if it exists and is not expired,
+        else None. Combines the is_expired()+get_llm() check-then-act into a
+        single locked operation instead of two, closing the gap between them."""
+        with self._lock:
+            if session_id not in self.session_map:
+                return None
+            timestamp, llm = self.session_map[session_id]
+            if (datetime.now() - timestamp).total_seconds() > self.expires_in:
+                return None
+            return llm
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:

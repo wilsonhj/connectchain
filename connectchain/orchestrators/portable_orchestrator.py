@@ -81,9 +81,12 @@ class PortableOrchestrator:
         directly avoids that.
         """
         if isinstance(result, dict):
-            if "text" in result:
-                return result["text"]
-            if "output" in result:
-                return result["output"]
+            missing = object()
+            text = result.get("text", missing)
+            if text is not missing:
+                return text
+            output = result.get("output", missing)
+            if output is not missing:
+                return output
             return str(result)
         return result
