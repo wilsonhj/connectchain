@@ -45,15 +45,20 @@ class ValidLLMChain(LLMChain):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Run the chain and sanitize the LLM *response* before returning.
+        """Run the chain; the LLM *response* is already sanitized by the time this returns.
 
-        *args and **kwargs are forwarded to Chain.run() unmodified so its
-        own input validation and the kwargs-only calling convention for
-        multi-input chains (chain.run(key1=val1, key2=val2)) behave exactly
-        as they do on the base class.
+        Chain.run() internally calls self(...), i.e. Chain.__call__, which calls
+        self.invoke(...) -- and since self is a ValidLLMChain, that's a polymorphic
+        dispatch to THIS class's invoke() override below, which already sanitizes.
+        Do not add a second self._sanitize(...) call here: doing so double-applies
+        the sanitizer (verified: a sanitizer wrapping its input in "[S:...]" produces
+        "[S:[S:...]]" instead of "[S:...]").
+
+        *args and **kwargs are forwarded to Chain.run() unmodified so its own input
+        validation and the kwargs-only calling convention for multi-input chains
+        (chain.run(key1=val1, key2=val2)) behave exactly as they do on the base class.
         """
-        result = super().run(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
-        return self._sanitize(result)
+        return super().run(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
 
     async def arun(
         self,
@@ -63,13 +68,10 @@ class ValidLLMChain(LLMChain):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        """Async variant of run() — sanitize the LLM *response* before returning.
-        See run() for why *args/**kwargs are forwarded unmodified.
+        """Async variant of run() -- see run()'s docstring for why no additional
+        sanitization happens here (arun() dispatches through ainvoke() the same way).
         """
-        result = await super().arun(
-            *args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs
-        )
-        return self._sanitize(result)
+        return await super().arun(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
 
     def invoke(
         self,
@@ -95,10 +97,6 @@ class ValidLLMChain(LLMChain):
         """Async variant of invoke() — sanitize the LLM *response* before returning."""
         result = await super().ainvoke(input, config=config, **kwargs)
         return self._sanitize_dict(result)
-
-    def _sanitize(self, result: Any) -> Any:
-        """Apply output_sanitizer to a plain string result, if configured."""
-        return self.output_sanitizer(result) if self.output_sanitizer else result
 
     def _sanitize_dict(self, result: Any) -> Any:
         """Apply output_sanitizer to result[self.output_key] in place, if configured.

@@ -13,10 +13,9 @@
 import functools
 from typing import Any, Callable, List, Optional
 
-# BUG-5 FIX: Replace deprecated `from langchain.llms import BaseLLM` with the
-# canonical langchain-core import.  BaseLLM only covers legacy completion
-# models; all ConnectChain targets (ChatOpenAI, ChatAnthropic, etc.) inherit
-# from BaseChatModel which shares only the BaseLanguageModel base class.
+# BaseLLM only covers legacy completion models; all ConnectChain targets
+# (ChatOpenAI, ChatAnthropic, etc.) inherit from BaseChatModel, which shares
+# only the BaseLanguageModel base class.
 from langchain_core.language_models import BaseLanguageModel
 
 from .proxy_manager import ProxyConfig, ProxyManager

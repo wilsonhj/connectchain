@@ -42,50 +42,47 @@ class TestValidLLMChain(TestCase):
         return ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=sanitizer)
 
     # ── BUG-1 FIX: sanitizer must run on the LLM *response*, not the input ──
+    #
+    # IMPORTANT: run()/arun() must be tested by mocking the deepest real hook
+    # (LLMChain._call/_acall), NOT run()/arun() (or ValidLLMChain.run itself) or
+    # even LLMChain.run/arun directly. Chain.run() internally calls self(...) ->
+    # Chain.__call__ -> self.invoke(...), which polymorphically dispatches to
+    # ValidLLMChain.invoke() (this class's own override) -- so invoke() already
+    # sanitizes before run() ever gets the result back. Mocking run()/arun() at
+    # a shallow layer bypasses that real dispatch chain and hides bugs there
+    # (a double-sanitization regression here escaped 3 review rounds and 82
+    # passing tests for exactly this reason).
 
-    @patch("connectchain.chains.valid_llm_chain.ValidLLMChain.run")
-    def test_run_sanitizer_applied_to_output(self, mock_run):
-        """Sanitizer must transform the LLM *response*, not the user query."""
-        mock_run.return_value = "[SANITIZED:Interesting info about the Streak-backed Oriole.]"
+    def test_run_sanitizer_applied_to_output(self):
+        """Sanitizer must transform the LLM *response*, not the user query, and must
+        be applied exactly once (not zero times, not twice)."""
         chain = self._make_chain()
-        result = chain.run("Streak-backed Oriole")
-        # Result must carry the sanitizer marker
-        self.assertIn("[SANITIZED:", result)
-        # The raw query must NOT be the thing that was sanitized
-        self.assertNotEqual(result, "[SANITIZED:Streak-backed Oriole]")
+        with patch.object(LLMChain, "_call", return_value={"text": "Interesting info."}):
+            result = chain.run("Streak-backed Oriole")
+        self.assertEqual(result, "[SANITIZED:Interesting info.]")
 
-    @patch("connectchain.chains.valid_llm_chain.ValidLLMChain.run")
-    def test_run_sanitizer_raises_on_bad_output(self, mock_run):
+    def test_run_sanitizer_raises_on_bad_output(self):
         """Sanitizer raises OperationNotPermittedException when output is BADWORD."""
-        # Simulate the chain returning a bad word from the LLM
-        mock_run.side_effect = OperationNotPermittedException("Illegal execution detected: BADWORD")
         chain = self._make_chain()
-        with self.assertRaises(OperationNotPermittedException):
-            chain.run("any input")
+        with patch.object(LLMChain, "_call", return_value={"text": "BADWORD"}):
+            with self.assertRaises(OperationNotPermittedException):
+                chain.run("any input")
 
     def test_run_no_sanitizer_returns_raw_output(self):
         """When output_sanitizer is None, the raw LLM response is returned unchanged."""
         chain = self._make_chain(sanitizer=None)
-        with patch.object(LLMChain, "run", return_value="raw LLM response"):
+        with patch.object(LLMChain, "_call", return_value={"text": "raw LLM response"}):
             result = chain.run("anything")
         self.assertEqual(result, "raw LLM response")
 
     def test_arun_sanitizer_applied_to_output(self):
-        """Async arun() override must also apply the sanitizer to the LLM response.
+        """Async arun() must also apply the sanitizer to the LLM response, exactly once."""
 
-        NOTE: The original version of this test tried `chain.arun = fake_arun`, which
-        raises `ValueError: "ValidLLMChain" object has no field "arun"` — ValidLLMChain
-        is a pydantic model and rejects instance attribute assignment for anything not
-        declared as a field (see llm_proxy_wrapper.py's own docstring on this exact
-        pydantic quirk). Patching the parent class's arun() and calling the real
-        chain.arun() exercises the actual sanitizer logic instead.
-        """
-
-        async def fake_super_arun(*a, **kw):  # pylint: disable=unused-argument
-            return "Raw async LLM response"
+        async def fake_acall(*a, **kw):  # pylint: disable=unused-argument
+            return {"text": "Raw async LLM response"}
 
         chain = self._make_chain()
-        with patch.object(LLMChain, "arun", side_effect=fake_super_arun):
+        with patch.object(LLMChain, "_acall", side_effect=fake_acall):
             result = asyncio.run(chain.arun("query"))
         self.assertEqual(result, "[SANITIZED:Raw async LLM response]")
 
@@ -115,40 +112,27 @@ class TestValidLLMChain(TestCase):
             result = chain.invoke({"rare_bird_type": "anything"})
         self.assertEqual(result["text"], "raw LLM response")
 
-    def test_run_passes_through_extra_kwargs(self):
-        """REVIEW-FOLLOWUP: run() must not silently drop caller-supplied **kwargs."""
-        chain = self._make_chain()
-        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
-            chain.run("query", include_run_info=True)
-        mock_super_run.assert_called_once_with(
-            "query", callbacks=None, tags=None, metadata=None, include_run_info=True
-        )
-
-    def test_run_forwards_all_positional_args(self):
-        """External-review regression: run() used to hardcode super().run(args[0], ...),
-        silently dropping any positional args beyond the first instead of forwarding
-        them (and letting Chain.run()'s own "only one positional argument" validation
-        apply, as it does on the base class)."""
+    def test_run_forwards_args_and_kwargs_variants(self):
+        """run() must forward *args/**kwargs to Chain.run() unmodified across calling
+        conventions: extra positional args must not be silently dropped, and the
+        kwargs-only multi-input convention (chain.run(key1=val1, key2=val2) -- the
+        ONLY way Chain.run() supports multi-input, since it rejects multiple
+        positional args itself) must not crash with IndexError, as it did when
+        run() hardcoded super().run(args[0], ...)."""
+        cases = [
+            (("query",), {"include_run_info": True}),
+            (("query", "extra_positional"), {}),
+            ((), {"rare_bird_type": "Streak-backed Oriole"}),
+        ]
         chain = self._make_chain(sanitizer=None)
-        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
-            chain.run("query", "extra_positional")
-        mock_super_run.assert_called_once_with(
-            "query", "extra_positional", callbacks=None, tags=None, metadata=None
-        )
-
-    def test_run_kwargs_only_multi_input_does_not_crash(self):
-        """External-review regression: hardcoding args[0] crashed with IndexError
-        on the kwargs-only multi-input calling convention (chain.run(key1=val1,
-        key2=val2)), since that path is called with zero positional args. This is
-        the ONLY way Chain.run() supports multi-input chains -- multiple positional
-        args are explicitly rejected by Chain.run() itself."""
-        chain = self._make_chain(sanitizer=None)
-        with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
-            result = chain.run(rare_bird_type="Streak-backed Oriole")
-        mock_super_run.assert_called_once_with(
-            callbacks=None, tags=None, metadata=None, rare_bird_type="Streak-backed Oriole"
-        )
-        self.assertEqual(result, "raw")
+        for call_args, call_kwargs in cases:
+            with self.subTest(call_args=call_args, call_kwargs=call_kwargs):
+                with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
+                    result = chain.run(*call_args, **call_kwargs)
+                mock_super_run.assert_called_once_with(
+                    *call_args, callbacks=None, tags=None, metadata=None, **call_kwargs
+                )
+                self.assertEqual(result, "raw")
 
     def test_sanitize_dict_logs_warning_when_output_key_missing(self):
         """When output_sanitizer is set but output_key isn't in the result dict,

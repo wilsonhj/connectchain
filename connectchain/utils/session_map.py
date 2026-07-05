@@ -37,9 +37,16 @@ class SessionMap:
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
-                    cls._instance = super(SessionMap, cls).__new__(cls)
-                    cls._instance.expires_in = expires_in
-                    cls._instance._lock = threading.Lock()
+                    # Fully build the instance on a local var before publishing it to
+                    # cls._instance. A racing thread's outer `if cls._instance is None`
+                    # check (above, outside the lock) reads cls._instance directly, so
+                    # publishing a partially-built instance (e.g. before _lock is set)
+                    # would let that thread skip the lock entirely and use an instance
+                    # missing _lock, raising AttributeError.
+                    new_instance = super(SessionMap, cls).__new__(cls)
+                    new_instance.expires_in = expires_in
+                    new_instance._lock = threading.Lock()
+                    cls._instance = new_instance
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:
