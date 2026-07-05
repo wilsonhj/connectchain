@@ -85,8 +85,11 @@ class TestModel(unittest.TestCase):
         test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
         test_config.data["models"]["1"]["provider"] = "meta"
         self.setUpWithConfig(test_config)
-        with self.assertRaisesRegex(LCELModelException, "Not implemented") as _:
-            test_model = model()
+        # set the API key so the "unsupported provider" branch is reached instead of
+        # the earlier "API key not found" check
+        with patch.dict(os.environ, {"META_API_KEY": "test_key"}):
+            with self.assertRaisesRegex(LCELModelException, "not supported") as _:
+                test_model = model()
 
     def test_use_of_session_map(self):
         self.setUpWithConfig(get_mock_config())
