@@ -152,3 +152,54 @@ disk; `SessionMap`'s cache grows unbounded (never evicts expired entries); and
 `MCPToolAgent.ainvoke` executes independent tool calls sequentially instead of via
 `asyncio.gather`. None of these change behavior today, so they were left as a backlog
 rather than bundled into a bug-fix pass.
+
+## 6. Follow-up `/code-review` pass on this PR
+
+An 8-angle review of this PR's own diff (correctness × 3, reuse, simplification,
+efficiency, altitude, conventions) found that two of the ten fixes above didn't fully
+close the bug they targeted, plus a security regression this PR introduced. All three
+were fixed, each validated by writing a test that fails against the pre-fix code and
+passes against the post-fix code:
+
+- **`ConnectChainNoAccessException` regressed from a security control to an ordinary
+  exception.** Changing it to `Exception` (grouped in with the other three, legitimately
+  operational, exceptions above) meant the deliberate `APIChain` kill-switch in
+  `connectchain/__init__.py` could now be silently swallowed by an ordinary
+  `except Exception:` around application code — defeating the point of the block.
+  Reverted to `BaseException` with a comment explaining why it's the exception to this
+  pattern. See `tests/unit_tests/test_api_chain_block.py`.
+- **`SessionMap.__new__`'s fix relocated the bug rather than fixing it.** Updating
+  `expires_in` on every construction (instead of only the first) stops a later config
+  from being silently ignored, but `expires_in` was still one shared field checked by
+  every cached session — so a later `SessionMap(different_interval)` call for one model
+  would retroactively change the expiry policy applied to another model's already-cached
+  session. Fixed by capturing `expires_in` per-session at cache time (alongside the
+  timestamp) instead of reading the singleton's current value at check time. See
+  `tests/unit_tests/test_session_map.py::test_expires_in_is_captured_per_session_not_shared`.
+- **Azure misconfiguration now fails silently instead of loudly.** The `hasattr`→`getattr`
+  fix for `_get_direct_model_`'s Azure branch was correct in isolation, but changed the
+  gating condition from "always true" (guaranteed, visible crash on `AzureOpenAI(
+  api_version=None)`) to "false when `api_version` is unset" — which falls through to
+  constructing a plain `ChatOpenAI` pointed at the Azure endpoint, silently sending
+  non-Azure-shaped requests that fail confusingly at call time. Added an explicit check
+  that raises `LCELModelException` with a clear message when an Azure-shaped `api_base`
+  is configured without `api_version`. See
+  `tests/unit_tests/test_model.py::test_model_azure_endpoint_without_api_version_raises`.
+
+Also deduplicated the `api_version`-supplied-twice workaround (previously copy-pasted
+across `_get_azure_model_` and `_get_direct_model_`'s Azure branch) into one
+`_azure_model_kwargs_()` helper.
+
+Two more review findings were deliberately **not** fixed, to avoid a larger, riskier
+change than the finding warranted:
+- `ConfigWrapper.__getattr__` returning `None` instead of raising `AttributeError` for a
+  missing key is the root cause `_get_direct_model_`'s two patches work around, but fixing
+  it would change behavior at every other direct (non-`hasattr`/`getattr`-guarded)
+  attribute access in the codebase — e.g. `SessionMap.uuid_from_config`'s
+  `if model_config.eas:` relies on the current None-returning behavior for models that
+  don't override `eas`. Fixing the wrapper without auditing every call site risked
+  trading one bug for several new ones.
+- The bare `except (ImportError, ValueError, Exception)` in `_get_direct_model_` is
+  pre-existing (not introduced by this PR) and is already fixed by the pending, separate
+  PR #3 — duplicating that fix here would recreate the exact merge-conflict risk this
+  document already flags for other overlapping files.

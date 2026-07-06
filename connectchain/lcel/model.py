@@ -109,6 +109,14 @@ def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLangua
     return session_map.get_llm(model_session_key)  # type: ignore[return-value]
 
 
+def _azure_model_kwargs_(engine: Any) -> dict:
+    """Shared model_kwargs for AzureOpenAI. api_version is deliberately not repeated
+    here: both callers already pass it as a direct constructor kwarg, and AzureOpenAI's
+    pydantic validation rejects api_version appearing a second time inside model_kwargs
+    ('supplied twice')."""
+    return {"engine": engine, "api_type": "azure"}
+
+
 def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
     """Get a ChatOpenAI instance"""
     llm = ChatOpenAI(
@@ -133,12 +141,7 @@ def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
         api_key=SecretStr(auth_token) if auth_token else None,
         azure_endpoint=model_config.api_base,
         api_version=model_config.api_version,
-        # api_version is already a direct kwarg above; AzureOpenAI's pydantic validation
-        # rejects it appearing a second time inside model_kwargs ("supplied twice").
-        model_kwargs={
-            "engine": model_config.engine,
-            "api_type": "azure",
-        },
+        model_kwargs=_azure_model_kwargs_(model_config.engine),
     )
     return llm
 
@@ -202,6 +205,11 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         is_azure = api_base and "openai.azure.com" in str(api_base)
 
         api_version = getattr(model_config, "api_version", None)
+        if is_azure and not api_version:
+            raise LCELModelException(
+                f"Azure OpenAI endpoint detected ({api_base}) but no api_version is "
+                f"configured; api_version is required for Azure OpenAI."
+            )
         if is_azure and api_version:
             # Azure OpenAI with direct API key. Note: getattr(..., "engine", <default>) can't
             # fall back here either, for the same ConfigWrapper.__getattr__-returns-None reason
@@ -212,12 +220,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 api_key=SecretStr(api_key),
                 azure_endpoint=api_base,
                 api_version=api_version,
-                # api_version is already a direct kwarg above; AzureOpenAI's pydantic
-                # validation rejects it appearing a second time inside model_kwargs.
-                model_kwargs={
-                    "engine": engine,
-                    "api_type": "azure",
-                },
+                model_kwargs=_azure_model_kwargs_(engine),
             )
         else:
             # Standard OpenAI

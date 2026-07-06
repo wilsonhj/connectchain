@@ -91,6 +91,19 @@ class TestModel(unittest.TestCase):
             with self.assertRaisesRegex(LCELModelException, "not supported") as _:
                 test_model = model()
 
+    def test_model_azure_endpoint_without_api_version_raises(self):
+        """An Azure-shaped api_base without api_version must fail loudly instead of
+        silently falling back to a non-Azure ChatOpenAI client pointed at Azure."""
+        test_config = get_mock_config()
+        test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
+        test_config.data["models"]["1"]["bypass_eas"] = True
+        test_config.data["models"]["1"]["api_base"] = "https://my-resource.openai.azure.com/"
+        del test_config.data["models"]["1"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
+            with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+                test_model = model()
+
     def test_use_of_session_map(self):
         self.setUpWithConfig(get_mock_config())
         test_model = model()

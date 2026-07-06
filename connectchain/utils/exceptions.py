@@ -16,5 +16,9 @@ class OperationNotPermittedException(Exception):
     """Operation Not Permitted Exception"""
 
 
-class ConnectChainNoAccessException(Exception):
-    """ConnectChain does not allow access to this class or method."""
+class ConnectChainNoAccessException(BaseException):
+    """ConnectChain does not allow access to this class or method.
+
+    Deliberately not Exception: this enforces the APIChain security block in
+    connectchain/__init__.py, and must not be catchable by an ordinary
+    `except Exception` around application code wrapping a chain call."""

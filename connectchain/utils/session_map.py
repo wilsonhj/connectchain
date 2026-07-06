@@ -20,28 +20,34 @@ class SessionMap:
     """This class is used to keep track of the session expiration time"""
 
     _instance: Optional["SessionMap"] = None
-    session_map: Dict[str, Tuple[datetime, LLMResult]] = {}
+    # Each entry stores the expires_in that was active when it was cached, not the
+    # singleton's current value -- a later SessionMap(different_interval) call must not
+    # retroactively change the expiry policy for sessions cached under a prior interval.
+    session_map: Dict[str, Tuple[datetime, int, LLMResult]] = {}
     expires_in: int = -1
 
     def __new__(cls, expires_in: int = 900) -> "SessionMap":
         if cls._instance is None:
             cls._instance = super(SessionMap, cls).__new__(cls)
         # Update on every call, not just the first -- this is a singleton, so a later
-        # caller configuring a different expires_in must not be silently ignored.
+        # caller configuring a different expires_in must not be silently ignored for
+        # sessions it caches from here on. (Already-cached sessions keep their own
+        # expires_in, captured in new_session(), so this doesn't affect them.)
         cls._instance.expires_in = expires_in
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:
         """save new session for later"""
-        self.session_map[session_id] = (datetime.now(), llm)
+        self.session_map[session_id] = (datetime.now(), self.expires_in, llm)
 
     def is_expired(self, session_id: str) -> bool:
         """check if the session is expired"""
-        return (datetime.now() - self.session_map[session_id][0]).total_seconds() > self.expires_in
+        cached_at, expires_in, _ = self.session_map[session_id]
+        return (datetime.now() - cached_at).total_seconds() > expires_in
 
     def get_llm(self, session_id: str) -> LLMResult:
         """get the LLM instance from the session"""
-        return self.session_map[session_id][1]
+        return self.session_map[session_id][2]
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:
