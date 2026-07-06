@@ -18,7 +18,7 @@ asynchronous invocation, error handling, and tool result aggregation."""
 
 import asyncio
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain.schema import AIMessage
 from langchain.schema.runnable import Runnable, RunnableConfig
@@ -36,7 +36,15 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
 
     def __init__(self, model_id: str, tools: List[BaseTool]):
         self.model_id = model_id
-        self.tools = {tool.name: tool for tool in tools}
+        self.tools: Dict[str, BaseTool] = {}
+        for tool in tools:
+            if tool.name in self.tools:
+                logging.getLogger(__name__).warning(
+                    "Duplicate tool name '%s' from multiple servers; the later one "
+                    "overrides the earlier one.",
+                    tool.name,
+                )
+            self.tools[tool.name] = tool
 
     async def ainvoke(
         self,
@@ -52,7 +60,12 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
         response = await llm.ainvoke(input, config)
 
         if not hasattr(response, "tool_calls") or not response.tool_calls:
-            return response
+            # Match the declared `-> dict` contract on every path, not just when tools
+            # are requested -- otherwise callers can't uniformly do result["content"].
+            return {
+                "content": response.content if isinstance(response, AIMessage) else str(response),
+                "tool_results": [],
+            }
 
         results = []
         for tool_call in response.tool_calls:

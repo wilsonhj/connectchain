@@ -35,7 +35,7 @@ from connectchain.utils import Config
 # defined in the config file under eas.secret_key
 
 
-class UtilException(BaseException):
+class UtilException(Exception):
     """Custom exception class for token_util"""
 
 

@@ -21,7 +21,7 @@ from connectchain.utils import Config, SessionMap, get_token_from_env
 from connectchain.utils.llm_proxy_wrapper import wrap_llm_with_proxy
 
 
-class LCELModelException(BaseException):
+class LCELModelException(Exception):
     """Base exception for the LCEL model"""
 
 
@@ -133,9 +133,10 @@ def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
         api_key=SecretStr(auth_token) if auth_token else None,
         azure_endpoint=model_config.api_base,
         api_version=model_config.api_version,
+        # api_version is already a direct kwarg above; AzureOpenAI's pydantic validation
+        # rejects it appearing a second time inside model_kwargs ("supplied twice").
         model_kwargs={
             "engine": model_config.engine,
-            "api_version": model_config.api_version,
             "api_type": "azure",
         },
     )
@@ -159,9 +160,12 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         if hasattr(model_config, "api_base") and model_config.api_base:
             config_dict["base_url"] = model_config.api_base
 
-        # Add temperature if specified
-        if hasattr(model_config, "temperature"):
-            config_dict["temperature"] = model_config.temperature
+        # Add temperature if specified. Note: getattr's default is never returned here
+        # because ConfigWrapper.__getattr__ returns None (not AttributeError) for a
+        # missing key, so we must check the resolved value instead of using hasattr().
+        temperature = getattr(model_config, "temperature", None)
+        if temperature is not None:
+            config_dict["temperature"] = temperature
 
         # Handle custom API key environment variable
         api_key_env = getattr(model_config, "api_key_env", None)
@@ -197,16 +201,21 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         api_base = getattr(model_config, "api_base", None)
         is_azure = api_base and "openai.azure.com" in str(api_base)
 
-        if is_azure and hasattr(model_config, "api_version"):
-            # Azure OpenAI with direct API key
+        api_version = getattr(model_config, "api_version", None)
+        if is_azure and api_version:
+            # Azure OpenAI with direct API key. Note: getattr(..., "engine", <default>) can't
+            # fall back here either, for the same ConfigWrapper.__getattr__-returns-None reason
+            # as above, so the model_name fallback is applied explicitly.
+            engine = getattr(model_config, "engine", None) or model_config.model_name
             return AzureOpenAI(
                 model=model_config.model_name,
                 api_key=SecretStr(api_key),
                 azure_endpoint=api_base,
-                api_version=model_config.api_version,
+                api_version=api_version,
+                # api_version is already a direct kwarg above; AzureOpenAI's pydantic
+                # validation rejects it appearing a second time inside model_kwargs.
                 model_kwargs={
-                    "engine": getattr(model_config, "engine", model_config.model_name),
-                    "api_version": model_config.api_version,
+                    "engine": engine,
                     "api_type": "azure",
                 },
             )

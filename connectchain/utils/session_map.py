@@ -26,7 +26,9 @@ class SessionMap:
     def __new__(cls, expires_in: int = 900) -> "SessionMap":
         if cls._instance is None:
             cls._instance = super(SessionMap, cls).__new__(cls)
-            cls._instance.expires_in = expires_in
+        # Update on every call, not just the first -- this is a singleton, so a later
+        # caller configuring a different expires_in must not be silently ignored.
+        cls._instance.expires_in = expires_in
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:

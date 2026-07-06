@@ -18,7 +18,7 @@ from typing import Any, Dict, Union
 import yaml
 
 
-class ConfigException(BaseException):
+class ConfigException(Exception):
     """Base exception for the config class"""
 
 

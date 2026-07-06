@@ -16,5 +16,5 @@ class OperationNotPermittedException(Exception):
     """Operation Not Permitted Exception"""
 
 
-class ConnectChainNoAccessException(BaseException):
+class ConnectChainNoAccessException(Exception):
     """ConnectChain does not allow access to this class or method."""

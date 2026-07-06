@@ -72,13 +72,16 @@ def _wrap_method_(
 
     Note: pydantic is a data validation framework and is not intended to be used as an architecture validation
     tool; despite the fact that it is used as such in Langchain."""
-    if hasattr(llm, method_name):
-        try:
-            func = getattr(llm, method_name)
-        except ValueError:
+    try:
+        if not hasattr(llm, method_name):
             return
-        wrapped_func = decorator(func, mixin)
-        llm.__dict__[method_name] = wrapped_func
+        func = getattr(llm, method_name)
+    except ValueError:
+        # hasattr()/getattr() can both trigger the same pydantic misbehavior this
+        # function's docstring warns about; either one raising means "skip it".
+        return
+    wrapped_func = decorator(func, mixin)
+    llm.__dict__[method_name] = wrapped_func
 
 
 def wrap_llm_with_proxy(llm: BaseLLM, proxy_config: Optional[ProxyConfig]) -> None:
