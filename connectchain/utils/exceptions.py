@@ -12,6 +12,17 @@
 """ConnectChain exceptions."""
 
 
+class NonRetryableError:
+    """Marker mixin for exceptions that must never be retried.
+
+    connectchain.utils.retry's base_retry()/abase_retry() re-raise instances of this
+    immediately, even when they match the caller's `exceptions` filter (which defaults
+    to `Exception`). Use for permanent/config errors -- e.g. a missing environment
+    variable or unsupported provider will never succeed on retry, so retrying just
+    delays the inevitable failure and burns `max_retry` attempts on nothing.
+    """
+
+
 class OperationNotPermittedException(Exception):
     """Operation Not Permitted Exception"""
 

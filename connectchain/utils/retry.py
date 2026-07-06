@@ -15,6 +15,8 @@ from functools import wraps
 from time import sleep
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union
 
+from .exceptions import NonRetryableError
+
 
 def base_retry(  # pylint: disable=too-many-arguments, too-many-positional-arguments
     func: Callable[..., Any],
@@ -47,6 +49,10 @@ def base_retry(  # pylint: disable=too-many-arguments, too-many-positional-argum
         try:
             return func(*args, **kwargs)
         except exceptions as e:
+            if isinstance(e, NonRetryableError):
+                # Permanent/config error: matches `exceptions` but retrying it can
+                # never succeed, so fail fast instead of burning max_retry attempts.
+                raise
             attempt += 1
             next_sleep = sleep_time * (2 ** (attempt - 1)) if ebo else sleep_time
             if attempt < max_retry:
@@ -91,6 +97,8 @@ async def abase_retry(  # pylint: disable=too-many-arguments, too-many-positiona
         try:
             return await func(*args, **kwargs)
         except exceptions as e:
+            if isinstance(e, NonRetryableError):
+                raise
             attempt += 1
             next_sleep = sleep_time * (2 ** (attempt - 1)) if ebo else sleep_time
             if attempt < max_retry:

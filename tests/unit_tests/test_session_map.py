@@ -78,3 +78,20 @@ class TestSessionMap(unittest.TestCase):
             llm,
         )
         self.assertTrue(reconfigured.is_expired("short-lived"))
+
+    def test_new_session_uses_explicit_expires_in_not_singleton_value_at_write_time(self):
+        """Regression test for a write-time race: a caller must be able to capture
+        expires_in immediately (e.g. before a slow network call) and have new_session()
+        honor that captured value, even if another caller reconfigures the singleton's
+        shared `expires_in` field in between -- reading self.expires_in only inside
+        new_session() would silently apply the wrong, most-recently-configured interval
+        instead of the one this session was actually meant to use."""
+        session_map = SessionMap(900)
+        captured_expires_in = session_map.expires_in  # captured "before the network call"
+
+        # Another request reconfigures the singleton for a different model in between.
+        SessionMap(1)
+
+        # Passing the captured value explicitly must win over the singleton's current value.
+        session_map.new_session("my-session", "llm-1", captured_expires_in)
+        self.assertEqual(session_map.session_map["my-session"][1], 900)

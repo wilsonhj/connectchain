@@ -36,9 +36,17 @@ class SessionMap:
         cls._instance.expires_in = expires_in
         return cls._instance
 
-    def new_session(self, session_id: str, llm: LLMResult) -> None:
-        """save new session for later"""
-        self.session_map[session_id] = (datetime.now(), self.expires_in, llm)
+    def new_session(self, session_id: str, llm: LLMResult, expires_in: Optional[int] = None) -> None:
+        """Save new session for later.
+
+        Pass `expires_in` explicitly when the caller captured it before doing
+        anything slow (e.g. a network call): reading self.expires_in only at this
+        point would race a concurrent SessionMap(other_interval) call made by another
+        request in between, silently applying the wrong expiry to this session.
+        """
+        if expires_in is None:
+            expires_in = self.expires_in
+        self.session_map[session_id] = (datetime.now(), expires_in, llm)
 
     def is_expired(self, session_id: str) -> bool:
         """check if the session is expired"""

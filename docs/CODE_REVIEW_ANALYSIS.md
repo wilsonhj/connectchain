@@ -203,3 +203,57 @@ change than the finding warranted:
   pre-existing (not introduced by this PR) and is already fixed by the pending, separate
   PR #3 — duplicating that fix here would recreate the exact merge-conflict risk this
   document already flags for other overlapping files.
+
+## 7. Follow-up review pass (branch `fix/pr4-review-followup`)
+
+An independent `/code-review` of this PR's own diff, cross-checked against pending PR #3
+and its own merge interaction, found 4 more real, reproduced bugs — 2 in the Azure
+`api_version` fix from section 3 (which was correct as far as it went but incomplete),
+1 in the exception-hierarchy fix from section 3 item 7, and 1 in the `SessionMap` fix
+from section 3 item 6. All 4 are fixed here, each verified by reproducing the bug
+against the pre-fix code first:
+
+1. **The Azure `api_version` guard added in section 3 was dead code for any realistic
+   model name.** `_get_direct_model_` tried `init_chat_model(model_name, **config_dict)`
+   first and returned immediately on success; for a normal name like `"gpt-4"`,
+   `init_chat_model` succeeds and returns a plain `ChatOpenAI` *without ever reaching*
+   the guard, silently pointing a non-Azure client at an Azure endpoint — the exact
+   failure the guard was meant to prevent. Fixed by detecting an Azure-shaped `api_base`
+   and routing straight to a dedicated `_get_direct_azure_model_` builder *before*
+   attempting `init_chat_model` at all, since that generic path has no notion of
+   `azure_endpoint`/`api_version`/`engine` regardless of whether it happens to succeed.
+2. **The same validation was missing from `_get_azure_model_` and `_get_chat_model_`**
+   (the EAS/enterprise-auth path) — a config missing `api_version` there still hit a raw
+   `pydantic.ValidationError` ("Must provide either the api_version argument or the
+   OPENAI_API_VERSION environment variable") instead of a clear `LCELModelException`.
+   Both now call the same `_require_api_version_` helper the direct-access path uses.
+3. **`LCELModelException`/`ConfigException` becoming `Exception` subclasses (section 3
+   item 7) made them silently retryable** by `connectchain/utils/retry.py`'s
+   `base_retry`/`abase_retry`, whose default `exceptions` filter is `Exception` — a
+   permanent, unfixable-by-retrying config error (missing API key, unsupported
+   provider, missing config file) would be retried `max_retry` times before finally
+   failing, wasting `sleep_time * max_retry` seconds for nothing. Fixed with a new
+   `NonRetryableError` marker mixin (`connectchain/utils/exceptions.py`): both
+   exceptions now also inherit from it, and `base_retry`/`abase_retry` re-raise
+   immediately on an `isinstance(e, NonRetryableError)` match, regardless of the
+   `exceptions` filter. `UtilException` was deliberately **not** given the marker —
+   it's also raised for non-200 EAS auth-service responses
+   (`TokenUtil.__response_builder`), which can be a transient service error genuinely
+   worth retrying, unlike the other two.
+4. **`SessionMap`'s per-session `expires_in` fix (section 3 item 6) closed the read-time
+   bug but left a write-time race.** `_get_openai_model_` called
+   `SessionMap(config.eas.token_refresh_interval)` and only read `session_map.expires_in`
+   back later, inside `new_session()`, *after* `get_token_from_env()`'s network call —
+   a concurrent request reconstructing the singleton for a different model's interval in
+   that window would make this session capture the wrong value. Fixed by capturing
+   `expires_in` into a local variable immediately (before the network call) and passing
+   it explicitly to `new_session(session_id, llm, expires_in)`, which now accepts it as
+   an optional parameter instead of only ever reading the singleton's current value.
+
+Two more findings from the same review were deliberately left unfixed, consistent with
+this document's existing skip criteria: `ConfigWrapper.__getattr__` returning `None`
+instead of raising for a missing key is the root cause the Azure fixes above work around,
+but fixing it would change behavior at other call sites that rely on the current
+None-returning behavior (e.g. `SessionMap.uuid_from_config`'s `if model_config.eas:`);
+and the bare `except (ImportError, ValueError, Exception)` in `_get_direct_model_` is
+pre-existing and already fixed by pending PR #3.

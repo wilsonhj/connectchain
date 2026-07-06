@@ -17,9 +17,12 @@ from typing import Any, Dict, Union
 
 import yaml
 
+from .exceptions import NonRetryableError
 
-class ConfigException(Exception):
-    """Base exception for the config class"""
+
+class ConfigException(Exception, NonRetryableError):
+    """Base exception for the config class. A missing/malformed config file will never
+    succeed on retry -- see NonRetryableError."""
 
 
 class Config:

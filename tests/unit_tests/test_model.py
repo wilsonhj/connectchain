@@ -104,6 +104,50 @@ class TestModel(unittest.TestCase):
             with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
                 test_model = model()
 
+    def test_model_azure_endpoint_realistic_model_name_without_api_version_raises(self):
+        """Regression test: a realistic model_name (e.g. "gpt-4") makes
+        langchain.chat_models.init_chat_model() succeed and return early on the fast
+        path, so the api_version guard must fire BEFORE that path is even attempted --
+        not only in the manual fallback branch reached when the fast path fails (which
+        is all test_model_azure_endpoint_without_api_version_raises above exercised,
+        via the fixture's non-standard model_name="test_model")."""
+        test_config = get_mock_config()
+        test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
+        test_config.data["models"]["1"]["bypass_eas"] = True
+        test_config.data["models"]["1"]["model_name"] = "gpt-4"
+        test_config.data["models"]["1"]["api_base"] = "https://my-resource.openai.azure.com/"
+        del test_config.data["models"]["1"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
+            with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+                test_model = model()
+
+    @patch("connectchain.lcel.model.ChatOpenAI", return_value=Mock(ChatOpenAI))
+    # pylint: disable=unused-argument
+    def test_model_eas_chat_missing_api_version_raises_clear_error(self, *args):
+        """Regression test: the EAS/_get_chat_model_ path must raise a clear
+        LCELModelException for a missing api_version instead of an opaque pydantic
+        ValidationError from deep inside ChatOpenAI's constructor."""
+        test_config = get_mock_config()
+        test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
+        del test_config.data["models"]["1"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+            test_model = model()
+
+    @patch("connectchain.lcel.model.AzureOpenAI", return_value=Mock(AzureOpenAI))
+    # pylint: disable=unused-argument
+    def test_model_eas_azure_missing_api_version_raises_clear_error(self, *args):
+        """Regression test: the EAS/_get_azure_model_ path must raise a clear
+        LCELModelException for a missing api_version instead of an opaque pydantic
+        ValidationError from deep inside AzureOpenAI's constructor."""
+        test_config = get_mock_config()
+        test_config.data["models"]["2"] = {**test_config.data["models"]["2"]}
+        del test_config.data["models"]["2"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+            test_model = model("2")
+
     def test_use_of_session_map(self):
         self.setUpWithConfig(get_mock_config())
         test_model = model()
