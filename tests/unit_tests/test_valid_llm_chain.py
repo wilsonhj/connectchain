@@ -43,15 +43,15 @@ class TestValidLLMChain(TestCase):
 
     # ── BUG-1 FIX: sanitizer must run on the LLM *response*, not the input ──
     #
-    # IMPORTANT: run()/arun() must be tested by mocking the deepest real hook
-    # (LLMChain._call/_acall), NOT run()/arun() (or ValidLLMChain.run itself) or
-    # even LLMChain.run/arun directly. Chain.run() internally calls self(...) ->
-    # Chain.__call__ -> self.invoke(...), which polymorphically dispatches to
-    # ValidLLMChain.invoke() (this class's own override) -- so invoke() already
-    # sanitizes before run() ever gets the result back. Mocking run()/arun() at
-    # a shallow layer bypasses that real dispatch chain and hides bugs there
-    # (a double-sanitization regression here escaped 3 review rounds and 82
-    # passing tests for exactly this reason).
+    # IMPORTANT: every dispatch path (run/arun/invoke/ainvoke) must be tested by
+    # mocking the deepest real hook -- LLMChain._call/_acall, which is where
+    # ValidLLMChain now applies the sanitizer -- NOT run()/arun()/invoke()/ainvoke()
+    # themselves. ValidLLMChain no longer overrides any of those four: they all
+    # dispatch through Chain's own machinery down to self._call()/self._acall(),
+    # so mocking at that shallower layer bypasses the real dispatch chain and hides
+    # bugs there (a double-sanitization regression escaped 3 review rounds and 82
+    # passing tests for exactly this reason, when sanitization used to live in
+    # invoke()/ainvoke() instead).
 
     def test_run_sanitizer_applied_to_output(self):
         """Sanitizer must transform the LLM *response*, not the user query, and must
@@ -87,52 +87,69 @@ class TestValidLLMChain(TestCase):
         self.assertEqual(result, "[SANITIZED:Raw async LLM response]")
 
     def test_invoke_sanitizer_applied_to_output(self):
-        """REVIEW-FOLLOWUP: .invoke() (the LCEL path PortableOrchestrator uses)
-        must also apply the sanitizer, not just run()/arun()."""
+        """.invoke() (the LCEL path PortableOrchestrator uses) must also apply the
+        sanitizer, not just run()/arun() -- exercised via the real dispatch chain
+        (Chain.invoke() -> self._call()), not by mocking invoke() itself, which
+        would bypass ValidLLMChain's actual sanitization hook entirely."""
         chain = self._make_chain()
-        with patch.object(LLMChain, "invoke", return_value={"text": "Raw LLM response"}):
+        with patch.object(LLMChain, "_call", return_value={"text": "Raw LLM response"}):
             result = chain.invoke({"rare_bird_type": "Streak-backed Oriole"})
         self.assertEqual(result["text"], "[SANITIZED:Raw LLM response]")
 
     def test_ainvoke_sanitizer_applied_to_output(self):
-        """REVIEW-FOLLOWUP (async): .ainvoke() must also apply the sanitizer."""
+        """Async .ainvoke() must also apply the sanitizer, exercised via the real
+        dispatch chain (Chain.ainvoke() -> self._acall())."""
 
-        async def fake_super_ainvoke(*a, **kw):  # pylint: disable=unused-argument
+        async def fake_acall(*a, **kw):  # pylint: disable=unused-argument
             return {"text": "Raw async LLM response"}
 
         chain = self._make_chain()
-        with patch.object(LLMChain, "ainvoke", side_effect=fake_super_ainvoke):
+        with patch.object(LLMChain, "_acall", side_effect=fake_acall):
             result = asyncio.run(chain.ainvoke({"rare_bird_type": "Streak-backed Oriole"}))
         self.assertEqual(result["text"], "[SANITIZED:Raw async LLM response]")
 
     def test_invoke_no_sanitizer_returns_raw_output(self):
         """When output_sanitizer is None, .invoke() returns the raw dict unchanged."""
         chain = self._make_chain(sanitizer=None)
-        with patch.object(LLMChain, "invoke", return_value={"text": "raw LLM response"}):
+        with patch.object(LLMChain, "_call", return_value={"text": "raw LLM response"}):
             result = chain.invoke({"rare_bird_type": "anything"})
         self.assertEqual(result["text"], "raw LLM response")
 
-    def test_run_forwards_args_and_kwargs_variants(self):
-        """run() must forward *args/**kwargs to Chain.run() unmodified across calling
-        conventions: extra positional args must not be silently dropped, and the
-        kwargs-only multi-input convention (chain.run(key1=val1, key2=val2) -- the
-        ONLY way Chain.run() supports multi-input, since it rejects multiple
-        positional args itself) must not crash with IndexError, as it did when
-        run() hardcoded super().run(args[0], ...)."""
-        cases = [
-            (("query",), {"include_run_info": True}),
-            (("query", "extra_positional"), {}),
-            ((), {"rare_bird_type": "Streak-backed Oriole"}),
-        ]
-        chain = self._make_chain(sanitizer=None)
-        for call_args, call_kwargs in cases:
-            with self.subTest(call_args=call_args, call_kwargs=call_kwargs):
-                with patch.object(LLMChain, "run", return_value="raw") as mock_super_run:
-                    result = chain.run(*call_args, **call_kwargs)
-                mock_super_run.assert_called_once_with(
-                    *call_args, callbacks=None, tags=None, metadata=None, **call_kwargs
-                )
-                self.assertEqual(result, "raw")
+    def test_sanitizer_runs_before_memory_save_and_on_chain_end_callback(self):
+        """Regression test: the sanitizer must be applied to what memory.save_context()
+        and the on_chain_end callback observe, not just to the caller-visible return
+        value. Sanitizing in invoke()/ainvoke() (after Chain.invoke() has already run
+        prep_outputs(), which saves to memory and fires on_chain_end with the *raw*
+        outputs) is too late -- verified live against real ConversationBufferMemory
+        and a real callback handler before moving sanitization into _call()/_acall()."""
+        from langchain.memory import ConversationBufferMemory  # pylint: disable=import-outside-toplevel
+        from langchain_core.callbacks import BaseCallbackHandler  # pylint: disable=import-outside-toplevel
+
+        memory = ConversationBufferMemory(memory_key="history", input_key="rare_bird_type")
+        chain = ValidLLMChain(
+            llm=ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key"),
+            prompt=PromptTemplate(
+                input_variables=["rare_bird_type", "history"],
+                template="History: {history}\nTell me about {rare_bird_type}.",
+            ),
+            output_sanitizer=lambda text: "REDACTED",
+            memory=memory,
+        )
+        seen_by_callback = []
+
+        class _RecordingHandler(BaseCallbackHandler):
+            def on_chain_end(self, outputs, **kwargs):  # pylint: disable=unused-argument
+                seen_by_callback.append(dict(outputs))
+
+        with patch.object(LLMChain, "_call", return_value={"text": "SECRET_RAW_RESPONSE"}):
+            result = chain.invoke(
+                {"rare_bird_type": "Oriole"}, config={"callbacks": [_RecordingHandler()]}
+            )
+
+        self.assertEqual(result["text"], "REDACTED")
+        self.assertNotIn("SECRET_RAW_RESPONSE", memory.buffer)
+        self.assertIn("REDACTED", memory.buffer)
+        self.assertEqual(seen_by_callback, [{"text": "REDACTED"}])
 
     def test_sanitize_dict_logs_warning_when_output_key_missing(self):
         """When output_sanitizer is set but output_key isn't in the result dict,

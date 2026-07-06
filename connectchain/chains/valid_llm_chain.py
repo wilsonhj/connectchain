@@ -15,11 +15,10 @@ In addition, it has a callback for sanitizing the output.
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
-from langchain.callbacks.base import Callbacks
 from langchain.chains.llm import LLMChain
-from langchain_core.runnables import RunnableConfig
+from langchain_core.callbacks import AsyncCallbackManagerForChainRun, CallbackManagerForChainRun
 
 logger = logging.getLogger(__name__)
 
@@ -30,73 +29,39 @@ class ValidLLMChain(LLMChain):
     Extension to LLMChain that sanitizes the model response if an
     output_sanitizer callable is provided.
 
-    The sanitizer is applied *after* the LLM call, on all four dispatch
-    paths: run(), arun(), invoke(), and ainvoke(). It is intentionally NOT
-    applied to the user's input.
+    The sanitizer runs inside _call()/_acall() -- the earliest point the raw LLM
+    response becomes a dict, BEFORE Chain.invoke()/ainvoke()'s own machinery
+    (prep_outputs) saves it to memory or fires the on_chain_end callback with it.
+    Sanitizing later, e.g. by overriding invoke()/ainvoke() and sanitizing the dict
+    those return, is too late: Chain.invoke() has already called
+    self.memory.save_context(inputs, outputs) and run_manager.on_chain_end(outputs)
+    with the *raw* outputs by that point (verified live: a memory-attached chain's
+    save_context() and an on_chain_end callback both observed the unsanitized
+    response even though the caller-visible return value was correctly sanitized).
+
+    run(), arun(), invoke(), and ainvoke() all dispatch through _call()/_acall() via
+    Chain's own __call__/invoke machinery, so this one override covers every entry
+    point -- no per-dispatch-path override is needed. It is intentionally NOT applied
+    to the user's input.
     """
 
     output_sanitizer: Optional[Callable[[str], str]]
 
-    def run(
+    def _call(
         self,
-        *args: Any,
-        callbacks: Callbacks = None,
-        tags: Optional[List[str]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Run the chain; the LLM *response* is already sanitized by the time this returns.
+        inputs: Dict[str, Any],
+        run_manager: Optional[CallbackManagerForChainRun] = None,
+    ) -> Dict[str, str]:
+        outputs = super()._call(inputs, run_manager=run_manager)
+        return self._sanitize_dict(outputs)
 
-        Chain.run() internally calls self(...), i.e. Chain.__call__, which calls
-        self.invoke(...) -- and since self is a ValidLLMChain, that's a polymorphic
-        dispatch to THIS class's invoke() override below, which already sanitizes.
-        Do not add a second self._sanitize(...) call here: doing so double-applies
-        the sanitizer (verified: a sanitizer wrapping its input in "[S:...]" produces
-        "[S:[S:...]]" instead of "[S:...]").
-
-        *args and **kwargs are forwarded to Chain.run() unmodified so its own input
-        validation and the kwargs-only calling convention for multi-input chains
-        (chain.run(key1=val1, key2=val2)) behave exactly as they do on the base class.
-        """
-        return super().run(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
-
-    async def arun(
+    async def _acall(
         self,
-        *args: Any,
-        callbacks: Callbacks = None,
-        tags: Optional[List[str]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Async variant of run() -- see run()'s docstring for why no additional
-        sanitization happens here (arun() dispatches through ainvoke() the same way).
-        """
-        return await super().arun(*args, callbacks=callbacks, tags=tags, metadata=metadata, **kwargs)
-
-    def invoke(
-        self,
-        input: Any,  # pylint: disable=redefined-builtin
-        config: Optional[RunnableConfig] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """LCEL entry point — sanitize the LLM *response* before returning.
-
-        `input` is typed Any (not Dict) because Chain.invoke() accepts a bare
-        value for single-input chains too -- Chain.prep_inputs() maps it onto
-        the chain's own input key, same as run() does via *args.
-        """
-        result = super().invoke(input, config=config, **kwargs)
-        return self._sanitize_dict(result)
-
-    async def ainvoke(
-        self,
-        input: Any,  # pylint: disable=redefined-builtin
-        config: Optional[RunnableConfig] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Async variant of invoke() — sanitize the LLM *response* before returning."""
-        result = await super().ainvoke(input, config=config, **kwargs)
-        return self._sanitize_dict(result)
+        inputs: Dict[str, Any],
+        run_manager: Optional[AsyncCallbackManagerForChainRun] = None,
+    ) -> Dict[str, str]:
+        outputs = await super()._acall(inputs, run_manager=run_manager)
+        return self._sanitize_dict(outputs)
 
     def _sanitize_dict(self, result: Any) -> Any:
         """Apply output_sanitizer to result[self.output_key] in place, if configured.

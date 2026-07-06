@@ -107,15 +107,43 @@ def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLangua
     return llm
 
 
+def _require_api_version_(model_config: Any, api_base: Any) -> Any:
+    """Validate api_version is configured before building an Azure client.
+
+    Without this, AzureOpenAI/ChatOpenAI(model_kwargs={"api_version": None, ...}) fails
+    with an opaque pydantic ValidationError ("Must provide either the api_version
+    argument or the OPENAI_API_VERSION environment variable") deep inside a third-party
+    constructor. Raising here gives a clear, actionable error instead.
+    """
+    api_version = getattr(model_config, "api_version", None)
+    if not api_version:
+        raise LCELModelException(
+            f"Azure OpenAI endpoint detected ({api_base}) but no api_version is "
+            f"configured; api_version is required for Azure OpenAI."
+        )
+    return api_version
+
+
+def _azure_model_kwargs_(engine: Any) -> dict:
+    """Shared model_kwargs for AzureOpenAI. api_version is deliberately not repeated
+    here: both callers already pass it as a direct constructor kwarg, and AzureOpenAI's
+    pydantic validation rejects api_version appearing a second time inside model_kwargs
+    ('supplied twice')."""
+    return {"engine": engine, "api_type": "azure"}
+
+
 def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
     """Get a ChatOpenAI instance"""
+    api_version = _require_api_version_(model_config, model_config.api_base)
     return ChatOpenAI(
         model=model_config.model_name,
         api_key=SecretStr(auth_token) if auth_token else None,
         base_url=model_config.api_base,
+        # api_version stays inside model_kwargs here (unlike _get_azure_model_ /
+        # _get_direct_azure_model_) because ChatOpenAI has no top-level api_version kwarg.
         model_kwargs={
             "engine": model_config.engine,
-            "api_version": model_config.api_version,
+            "api_version": api_version,
             "api_type": "azure",
         },
     )
@@ -123,17 +151,50 @@ def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
 
 def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
     """Get an AzureOpenAI instance"""
+    api_version = _require_api_version_(model_config, model_config.api_base)
     return AzureOpenAI(
         model=model_config.model_name,
         api_key=SecretStr(auth_token) if auth_token else None,
         azure_endpoint=model_config.api_base,
-        api_version=model_config.api_version,
-        model_kwargs={
-            "engine": model_config.engine,
-            "api_version": model_config.api_version,
-            "api_type": "azure",
-        },
+        api_version=api_version,
+        model_kwargs=_azure_model_kwargs_(model_config.engine),
     )
+
+
+def _get_direct_azure_model_(model_config: Any, api_key: str, api_base: Any) -> AzureOpenAI:
+    """Build a direct-API-key AzureOpenAI client.
+
+    Called from _get_direct_model_ BEFORE the generic init_chat_model() fast path is
+    even attempted: that fast path has no notion of azure_endpoint/api_version/engine,
+    so routing an Azure-shaped api_base through it would silently succeed with a plain
+    ChatOpenAI pointed at the Azure URL instead of a working (or clearly failing) Azure
+    client.
+    """
+    api_version = _require_api_version_(model_config, api_base)
+    engine = getattr(model_config, "engine", None) or model_config.model_name
+    return AzureOpenAI(
+        model=model_config.model_name,
+        api_key=SecretStr(api_key),
+        azure_endpoint=api_base,
+        api_version=api_version,
+        model_kwargs=_azure_model_kwargs_(engine),
+    )
+
+
+def _resolve_direct_api_key_(model_config: Any) -> str:
+    """Resolve the API key for a direct (non-EAS) model from its configured or
+    provider-default environment variable, raising a clear error if unset."""
+    api_key_env = getattr(model_config, "api_key_env", None)
+    if not api_key_env:
+        api_key_env = f"{model_config.provider.upper()}_API_KEY"
+
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        raise LCELModelException(
+            f"API key not found in environment variable: {api_key_env}. "
+            f"Please set it in your .env file or environment."
+        )
+    return api_key
 
 
 def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
@@ -145,6 +206,17 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     exception is unexpected and is re-raised as LCELModelException with the
     original traceback preserved via `raise ... from e`.
     """
+    # Azure-shaped configs are routed straight to a dedicated Azure builder, BEFORE the
+    # generic init_chat_model() fast path below is ever attempted. init_chat_model() has
+    # no notion of azure_endpoint/api_version/engine, so letting an Azure api_base reach
+    # it would silently succeed with a plain, non-Azure ChatOpenAI instead of a working
+    # (or clearly failing) Azure client.
+    api_base = getattr(model_config, "api_base", None)
+    is_azure = model_config.provider == "openai" and api_base and "openai.azure.com" in str(api_base)
+    if is_azure:
+        azure_api_key = _resolve_direct_api_key_(model_config)
+        return _get_direct_azure_model_(model_config, azure_api_key, api_base)
+
     try:
         from langchain.chat_models import init_chat_model  # pylint: disable=import-outside-toplevel
 
@@ -179,7 +251,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             f"Unexpected error initialising model '{model_config.model_name}': {e}"
         ) from e
 
-    # ── Manual provider-specific initialisation fallback ──────────────────────
+    # ── Manual provider-specific initialisation fallback (Azure already handled above) ──
     if model_config.provider not in _SUPPORTED_PROVIDERS:
         # Check provider support before the API-key lookup below, so an
         # unsupported provider fails fast with a clear message instead of a
@@ -189,32 +261,9 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
         )
 
-    api_key_env = getattr(model_config, "api_key_env", None)
-    if not api_key_env:
-        api_key_env = f"{model_config.provider.upper()}_API_KEY"
-
-    api_key = os.getenv(api_key_env)
-    if not api_key:
-        raise LCELModelException(
-            f"API key not found in environment variable: {api_key_env}. "
-            f"Please set it in your .env file or environment."
-        )
+    api_key = _resolve_direct_api_key_(model_config)
 
     if model_config.provider == "openai":
-        api_base = getattr(model_config, "api_base", None)
-        is_azure = api_base and "openai.azure.com" in str(api_base)
-        if is_azure and hasattr(model_config, "api_version"):
-            return AzureOpenAI(
-                model=model_config.model_name,
-                api_key=SecretStr(api_key),
-                azure_endpoint=api_base,
-                api_version=model_config.api_version,
-                model_kwargs={
-                    "engine": getattr(model_config, "engine", model_config.model_name),
-                    "api_version": model_config.api_version,
-                    "api_type": "azure",
-                },
-            )
         return ChatOpenAI(
             model=model_config.model_name,
             api_key=api_key,

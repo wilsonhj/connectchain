@@ -128,6 +128,65 @@ class TestModel(unittest.TestCase):
         test_model2 = model()
         self.assertIs(test_model, test_model2)
 
+    def test_direct_azure_model_does_not_supply_api_version_twice(self):
+        """Regression test: _get_direct_model_'s Azure branch must construct a real
+        (non-mocked) AzureOpenAI without pydantic rejecting api_version as supplied
+        twice (once as a direct kwarg, once inside model_kwargs)."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_base": "https://my-resource.openai.azure.com/",
+                "api_version": "2024-02-01",
+                "engine": "gpt-4",
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            result = _get_direct_model_(model_config)
+        self.assertIsInstance(result, AzureOpenAI)
+
+    def test_model_azure_endpoint_realistic_model_name_without_api_version_raises(self):
+        """Regression test: a realistic model_name (e.g. "gpt-4") makes
+        langchain.chat_models.init_chat_model() succeed and return early on the fast
+        path, so the api_version guard must fire BEFORE that path is even attempted --
+        not only in the manual fallback branch reached when the fast path fails."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_base": "https://my-resource.openai.azure.com/",
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+                _get_direct_model_(model_config)
+
+    @patch("connectchain.lcel.model.ChatOpenAI", return_value=Mock(ChatOpenAI))
+    # pylint: disable=unused-argument
+    def test_model_eas_chat_missing_api_version_raises_clear_error(self, *args):
+        """Regression test: the EAS/_get_chat_model_ path must raise a clear
+        LCELModelException for a missing api_version instead of an opaque pydantic
+        ValidationError from deep inside ChatOpenAI's constructor."""
+        test_config = get_mock_config()
+        test_config.data["models"]["1"] = {**test_config.data["models"]["1"]}
+        del test_config.data["models"]["1"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+            test_model = model()
+
+    @patch("connectchain.lcel.model.AzureOpenAI", return_value=Mock(AzureOpenAI))
+    # pylint: disable=unused-argument
+    def test_model_eas_azure_missing_api_version_raises_clear_error(self, *args):
+        """Regression test: the EAS/_get_azure_model_ path must raise a clear
+        LCELModelException for a missing api_version instead of an opaque pydantic
+        ValidationError from deep inside AzureOpenAI's constructor."""
+        test_config = get_mock_config()
+        test_config.data["models"]["2"] = {**test_config.data["models"]["2"]}
+        del test_config.data["models"]["2"]["api_version"]
+        self.setUpWithConfig(test_config)
+        with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
+            test_model = model("2")
+
     @patch("connectchain.lcel.model.wrap_llm_with_proxy")
     def test_model_configured_with_no_proxy(self, mock_wrap_with_proxy):
         self.setUpWithConfig(get_mock_config())
