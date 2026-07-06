@@ -171,14 +171,14 @@ Track upstream changes: [langchain-ai/langchain releases](https://github.com/lan
 
 ## 7. Bug History
 
-The five bugs below were found in a code review and fixed on `main`; kept here for context on *why* several modules look the way they do, not as an open worklist.
+The five bugs below were found in a code review. **They are not fixed on this branch or on `main`** — the fixes exist only in a separate, still-open pull request. This table documents the findings for context; it is not a changelog of this branch's own code.
 
-| Area | File | Root Cause (as found) | Resolution |
+| Area | File | Root Cause (as found) | Fix (in the separate PR, not yet merged) |
 |------|------|-----------|-------------|
-| Output sanitizer bypass | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `run()`/`arun()`/`invoke()`/`ainvoke()` now all sanitize the response after calling the underlying chain |
-| SessionMap KeyError | `utils/session_map.py` | `is_expired()` indexed the session dict directly, raising `KeyError` for an unregistered session | Existence + expiry are now checked together (`get_valid_llm()`), returning `None`/`True` instead of raising |
-| Deprecated LangChain API | `orchestrators/portable_orchestrator.py` | Called `LLMChain.run()`/`.arun()`, deprecated since LangChain 0.1.0 | Now uses `.invoke()`/`.ainvoke()` |
+| Output sanitizer bypass | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `run()`/`arun()`/`invoke()`/`ainvoke()` sanitize the response after calling the underlying chain |
+| SessionMap KeyError | `utils/session_map.py` | `is_expired()` indexed the session dict directly, raising `KeyError` for an unregistered session | Existence + expiry are checked together (`get_valid_llm()`), returning `None`/`True` instead of raising |
+| Deprecated LangChain API | `orchestrators/portable_orchestrator.py` | Called `LLMChain.run()`/`.arun()`, deprecated since LangChain 0.1.0 | Uses `.invoke()`/`.ainvoke()` instead |
 | Silent exception swallowing | `lcel/model.py` | A bare `except (ImportError, ValueError, Exception)` discarded all errors during model init | Expected fallback exceptions are logged; anything else is re-raised as `LCELModelException` with the original traceback |
 | Wrong base class | `utils/llm_proxy_wrapper.py` | Imported `langchain.llms.BaseLLM`, which only covers legacy completion models | Uses `langchain_core.language_models.BaseLanguageModel`, which covers `BaseChatModel` too |
 
-A follow-up review round also found and fixed: `PortableOrchestrator` was passing a hardcoded `{"input": query}` to `.invoke()`/`.ainvoke()`, which broke every real prompt template (the input key has to match the prompt's actual variable name); `run()`/`arun()` crashed with `IndexError` on the kwargs-only multi-input calling convention; and a `SessionMap` singleton-construction race. See the git log for details.
+A follow-up review round on that same PR also found and fixed: `PortableOrchestrator` was passing a hardcoded `{"input": query}` to `.invoke()`/`.ainvoke()`, which broke every real prompt template (the input key has to match the prompt's actual variable name); `run()`/`arun()` crashed with `IndexError` on the kwargs-only multi-input calling convention; and a `SessionMap` singleton-construction race. None of this is present in this branch's code — see that PR for details and current status before relying on this table as a description of the code you're reading.
