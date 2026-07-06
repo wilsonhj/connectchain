@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 """This module is used to keep track of the session expiration time"""
+import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,33 +18,84 @@ from langchain.schema import LLMResult
 
 
 class SessionMap:
-    """This class is used to keep track of the session expiration time"""
+    """Singleton tracking session expiration time for cached LLM instances.
+
+    is_expired()/get_llm()/get_valid_llm() return/raise safely for an
+    unregistered session_id rather than raising KeyError (get_llm() is the
+    one exception -- see its docstring). _instance_lock guards first
+    construction via double-checked locking; self._lock (created once
+    construction completes) guards all session_map reads/writes.
+    """
 
     _instance: Optional["SessionMap"] = None
+    _instance_lock: threading.Lock = threading.Lock()
+    _lock: threading.Lock
     session_map: Dict[str, Tuple[datetime, LLMResult]] = {}
     expires_in: int = -1
 
     def __new__(cls, expires_in: int = 900) -> "SessionMap":
         if cls._instance is None:
-            cls._instance = super(SessionMap, cls).__new__(cls)
-            cls._instance.expires_in = expires_in
+            with cls._instance_lock:
+                if cls._instance is None:
+                    # Fully build the instance on a local var before publishing it to
+                    # cls._instance. A racing thread's outer `if cls._instance is None`
+                    # check (above, outside the lock) reads cls._instance directly, so
+                    # publishing a partially-built instance (e.g. before _lock is set)
+                    # would let that thread skip the lock entirely and use an instance
+                    # missing _lock, raising AttributeError.
+                    new_instance = super(SessionMap, cls).__new__(cls)
+                    new_instance.expires_in = expires_in
+                    new_instance._lock = threading.Lock()
+                    cls._instance = new_instance
         return cls._instance
 
     def new_session(self, session_id: str, llm: LLMResult) -> None:
-        """save new session for later"""
-        self.session_map[session_id] = (datetime.now(), llm)
+        """Save new session for later."""
+        with self._lock:
+            self.session_map[session_id] = (datetime.now(), llm)
+
+    def _is_stale(self, timestamp: datetime) -> bool:
+        """Whether a cached entry's timestamp has exceeded expires_in.
+
+        Caller must hold self._lock. Shared by is_expired() and
+        get_valid_llm() so the staleness rule lives in exactly one place.
+        """
+        return (datetime.now() - timestamp).total_seconds() > self.expires_in
 
     def is_expired(self, session_id: str) -> bool:
-        """check if the session is expired"""
-        return (datetime.now() - self.session_map[session_id][0]).total_seconds() > self.expires_in
+        """Check if the session is expired.
+
+        Returns True (treat as expired) when session_id is not yet registered
+        so that callers trigger a fresh token acquisition rather than raising
+        a KeyError.
+        """
+        with self._lock:
+            entry = self.session_map.get(session_id)
+            return entry is None or self._is_stale(entry[0])
 
     def get_llm(self, session_id: str) -> LLMResult:
-        """get the LLM instance from the session"""
-        return self.session_map[session_id][1]
+        """Get the LLM instance from the session.
+
+        Precondition: caller must confirm is_expired(session_id) returns
+        False first (or use get_valid_llm() instead, which does this
+        atomically). Raises KeyError if session_id is not registered.
+        """
+        with self._lock:
+            return self.session_map[session_id][1]
+
+    def get_valid_llm(self, session_id: str) -> Optional[LLMResult]:
+        """Return the cached LLM for session_id if it exists and is not expired,
+        else None. Checks existence and expiry atomically under one lock
+        acquisition, unlike calling is_expired() then get_llm() separately."""
+        with self._lock:
+            entry = self.session_map.get(session_id)
+            if entry is None or self._is_stale(entry[0]):
+                return None
+            return entry[1]
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:
-        """generate a uuid from the config"""
+        """Generate a UUID from the config."""
         env_id_key = None
         env_secret_key = None
         if model_config.eas:

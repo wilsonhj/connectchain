@@ -1,6 +1,4 @@
-# ConnectChain Fork — Architecture Guide
-
-> **Maintainer:** `wilsonhj` | **Base:** `americanexpress/connectchain` | **Last updated:** July 2026
+# ConnectChain — Architecture Guide
 
 ---
 
@@ -88,7 +86,7 @@ connectchain.chains.ValidLLMChain
 `langchain.chains`/`langchain.schema`/`langchain.llms` entirely, which this codebase imports
 throughout — an unbounded dependency range breaks the package outright on a fresh install.
 
-`PortableOrchestrator` already uses the LCEL `.invoke()`/`.ainvoke()` API (not the deprecated
+`PortableOrchestrator` uses the LCEL `.invoke()`/`.ainvoke()` API (not the deprecated
 `.run()`/`.arun()`), and token injection is a plain constructor argument
 (`ChatOpenAI(api_key=SecretStr(auth_token), ...)` in `connectchain/lcel/model.py`) — there is no
 monkey-patching involved in getting the token into the model client. (`connectchain.utils.proxy_manager`
@@ -132,6 +130,10 @@ get_valid_llm(session_key)   ← atomic: existence + expiry check under one lock
         [If output_sanitizer is set] applied to the response before returning
 ```
 
+`SessionMap`'s singleton is created via double-checked locking (`_instance_lock` guards first
+construction; `self._lock`, created only after construction completes, guards all `session_map`
+reads/writes) — see §7 for why both locks exist.
+
 ---
 
 ## 5. MCP Integration Layer
@@ -171,14 +173,19 @@ Track upstream changes: [langchain-ai/langchain releases](https://github.com/lan
 
 ## 7. Bug History
 
-The five bugs below were found in a code review. **They are not fixed on this branch or on `main`** — the fixes exist only in a separate, still-open pull request. This table documents the findings for context; it is not a changelog of this branch's own code.
+The bugs below were found across several rounds of code review (see this PR's commit history for
+full detail) and fixed on this branch; kept here for context on *why* several modules look the way
+they do, not as an open worklist.
 
-| Area | File | Root Cause (as found) | Fix (in the separate PR, not yet merged) |
+| Area | File | Root Cause (as found) | Resolution |
 |------|------|-----------|-------------|
-| Output sanitizer bypass | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `run()`/`arun()`/`invoke()`/`ainvoke()` sanitize the response after calling the underlying chain |
-| SessionMap KeyError | `utils/session_map.py` | `is_expired()` indexed the session dict directly, raising `KeyError` for an unregistered session | Existence + expiry are checked together (`get_valid_llm()`), returning `None`/`True` instead of raising |
-| Deprecated LangChain API | `orchestrators/portable_orchestrator.py` | Called `LLMChain.run()`/`.arun()`, deprecated since LangChain 0.1.0 | Uses `.invoke()`/`.ainvoke()` instead |
+| Output sanitizer bypass (input vs. response) | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `invoke()`/`ainvoke()` sanitize the response; `run()`/`arun()` return it as-is since they dispatch through `invoke()`/`ainvoke()` internally (see next row) |
+| Output sanitizer applied twice | `chains/valid_llm_chain.py` | `run()`/`arun()` sanitized the result AND dispatched through `Chain.__call__` → `self.invoke()`/`self.ainvoke()`, which (via Python's polymorphism) already sanitized it once — e.g. `"[S:RAW]"` became `"[S:[S:RAW]]"` | `run()`/`arun()` no longer sanitize directly; they rely entirely on the `invoke()`/`ainvoke()` dispatch |
+| SessionMap KeyError | `utils/session_map.py` | `is_expired()` indexed the session dict directly, raising `KeyError` for an unregistered session | Existence + expiry are now checked together (`get_valid_llm()`), returning `None`/`True` instead of raising |
+| SessionMap singleton construction race | `utils/session_map.py` | `__new__`'s `cls._instance is None` check (and, in an earlier fix, the instance-attribute assignment order) had unguarded/unsafe windows under concurrent first construction | Double-checked locking via a class-level `_instance_lock`; the instance is fully built on a local variable before being published to `cls._instance` |
+| Deprecated LangChain API | `orchestrators/portable_orchestrator.py` | Called `LLMChain.run()`/`.arun()`, deprecated since LangChain 0.1.0 | Now uses `.invoke()`/`.ainvoke()` |
+| Broken input mapping | `orchestrators/portable_orchestrator.py` | `.invoke()`/`.ainvoke()` were called with a hardcoded `{"input": query}` dict; `Chain.prep_inputs()` only auto-maps a bare value onto the chain's real input key when the input isn't already a dict, so `"input"` had to exactly match the prompt's declared variable name (it essentially never did) — this broke every real prompt template | `query` is passed through unwrapped so `Chain.prep_inputs()` maps it correctly |
+| Wrong output-key guessing | `orchestrators/portable_orchestrator.py` | Response extraction guessed `"text"` then `"output"` as dict keys instead of reading the chain's actual `output_key` | Reads `self._chain.output_key` (default `"text"`) |
 | Silent exception swallowing | `lcel/model.py` | A bare `except (ImportError, ValueError, Exception)` discarded all errors during model init | Expected fallback exceptions are logged; anything else is re-raised as `LCELModelException` with the original traceback |
+| Unsupported-provider check ordering | `lcel/model.py` | The API-key lookup ran before checking whether the provider was even supported, so an unsupported provider raised a misleading "API key not found" instead of "not supported" | Provider-support check now runs first |
 | Wrong base class | `utils/llm_proxy_wrapper.py` | Imported `langchain.llms.BaseLLM`, which only covers legacy completion models | Uses `langchain_core.language_models.BaseLanguageModel`, which covers `BaseChatModel` too |
-
-A follow-up review round on that same PR also found and fixed: `PortableOrchestrator` was passing a hardcoded `{"input": query}` to `.invoke()`/`.ainvoke()`, which broke every real prompt template (the input key has to match the prompt's actual variable name); `run()`/`arun()` crashed with `IndexError` on the kwargs-only multi-input calling convention; and a `SessionMap` singleton-construction race. None of this is present in this branch's code — see that PR for details and current status before relying on this table as a description of the code you're reading.
