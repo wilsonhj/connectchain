@@ -11,6 +11,7 @@
 # the License.
 """Proxied LLM Utilities"""
 import functools
+import logging
 from typing import Any, Callable, List, Optional
 
 # BaseLLM only covers legacy completion models; all ConnectChain targets
@@ -19,6 +20,8 @@ from typing import Any, Callable, List, Optional
 from langchain_core.language_models import BaseLanguageModel
 
 from .proxy_manager import ProxyConfig, ProxyManager
+
+logger = logging.getLogger(__name__)
 
 _llm_sync_methods_: List[str] = [
     "invoke",
@@ -79,7 +82,15 @@ def _wrap_method_(
         func = getattr(llm, method_name)
     except ValueError:
         # hasattr()/getattr() can both trigger the same pydantic misbehavior this
-        # function's docstring warns about; either one raising means "skip it".
+        # function's docstring warns about; either one raising means "skip it" --
+        # but say so: a silently unwrapped method means traffic bypasses the
+        # configured proxy with no visible trace otherwise.
+        logger.warning(
+            "Could not proxy-wrap method '%s' on %s (attribute access raised ValueError); "
+            "calls through this method will NOT use the configured proxy.",
+            method_name,
+            type(llm).__name__,
+        )
         return
     wrapped_func = decorator(func, mixin)
     llm.__dict__[method_name] = wrapped_func

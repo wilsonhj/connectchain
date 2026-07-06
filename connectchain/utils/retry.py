@@ -18,6 +18,24 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union
 from .exceptions import NonRetryableError
 
 
+def _fail_fast_(
+    error: BaseException,
+    exceptions: Union[Tuple[type[BaseException], ...], type[BaseException]],
+) -> bool:
+    """Whether a caught error should skip retries entirely.
+
+    NonRetryableError-marked exceptions fail fast under the default
+    `exceptions=Exception` filter -- a permanent/config error can never succeed
+    on retry. But a caller who EXPLICITLY lists a NonRetryableError-marked type
+    in `exceptions` has opted into retrying that family, and that explicit
+    request wins over the marker.
+    """
+    if not isinstance(error, NonRetryableError):
+        return False
+    exc_types = exceptions if isinstance(exceptions, tuple) else (exceptions,)
+    return not any(issubclass(t, NonRetryableError) for t in exc_types)
+
+
 def base_retry(  # pylint: disable=too-many-arguments, too-many-positional-arguments
     func: Callable[..., Any],
     args: Optional[Tuple[Any, ...]] = None,
@@ -49,7 +67,7 @@ def base_retry(  # pylint: disable=too-many-arguments, too-many-positional-argum
         try:
             return func(*args, **kwargs)
         except exceptions as e:
-            if isinstance(e, NonRetryableError):
+            if _fail_fast_(e, exceptions):
                 # Permanent/config error: matches `exceptions` but retrying it can
                 # never succeed, so fail fast instead of burning max_retry attempts.
                 raise
@@ -97,7 +115,7 @@ async def abase_retry(  # pylint: disable=too-many-arguments, too-many-positiona
         try:
             return await func(*args, **kwargs)
         except exceptions as e:
-            if isinstance(e, NonRetryableError):
+            if _fail_fast_(e, exceptions):
                 raise
             attempt += 1
             next_sleep = sleep_time * (2 ** (attempt - 1)) if ebo else sleep_time

@@ -182,3 +182,27 @@ class TestSessionMap(unittest.TestCase):
         # Passing the captured value explicitly must win over the singleton's current value.
         session_map.new_session("my-session", "llm-1", captured_expires_in)
         self.assertEqual(session_map.session_map["my-session"][1], 900)
+
+    def test_bare_construction_does_not_reset_configured_interval(self):
+        """CODE-REVIEW regression: SessionMap() with no argument (e.g. constructed just
+        to read the cache) must NOT silently reset a previously configured interval
+        back to the default."""
+        SessionMap(3600)
+        sm = SessionMap()  # bare read-only construction
+        self.assertEqual(sm.expires_in, 3600)
+        sm.new_session("k", "llm")
+        self.assertEqual(sm.session_map["k"][1], 3600)
+        # An explicit reconfiguration still works.
+        SessionMap(60)
+        self.assertEqual(sm.expires_in, 60)
+
+    def test_missing_token_refresh_interval_uses_default_not_none(self):
+        """CODE-REVIEW regression: a config without eas.token_refresh_interval reaches
+        SessionMap as None (ConfigWrapper returns None for missing keys). That must
+        fall back to the default -- previously the entry cached expires_in=None and
+        every later cache-hit expiry check crashed with TypeError ('>' vs NoneType)."""
+        sm = SessionMap(None)
+        self.assertEqual(sm.expires_in, SessionMap.DEFAULT_EXPIRES_IN)
+        sm.new_session("k", "llm", None)
+        self.assertEqual(sm.session_map["k"][1], SessionMap.DEFAULT_EXPIRES_IN)
+        self.assertFalse(sm.is_expired("k"))  # must not raise TypeError

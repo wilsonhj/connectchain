@@ -20,11 +20,13 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from langchain.schema import AIMessage
 from langchain.schema.runnable import Runnable, RunnableConfig
 from langchain.tools import BaseTool
+from langchain_core.messages import BaseMessage
 
 from ...lcel import model
+
+logger = logging.getLogger(__name__)
 
 
 class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
@@ -39,7 +41,7 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
         self.tools: Dict[str, BaseTool] = {}
         for tool in tools:
             if tool.name in self.tools:
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "Duplicate tool name '%s' from multiple servers; the later one "
                     "overrides the earlier one.",
                     tool.name,
@@ -63,7 +65,7 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
             # Match the declared `-> dict` contract on every path, not just when tools
             # are requested -- otherwise callers can't uniformly do result["content"].
             return {
-                "content": response.content if isinstance(response, AIMessage) else str(response),
+                "content": response.content if isinstance(response, BaseMessage) else str(response),
                 "tool_results": [],
             }
 
@@ -77,15 +79,15 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
                     result = await self.tools[tool_name].ainvoke(tool_args)
                     results.append({"tool": tool_name, "result": result})
                 except Exception as e:  # pylint: disable=broad-except
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "Tool '%s' execution failed: %s", tool_name, e
                     )
                     results.append({"tool": tool_name, "error": str(e)})
             else:
-                logging.getLogger(__name__).warning("Unknown tool requested: %s", tool_name)
+                logger.warning("Unknown tool requested: %s", tool_name)
 
         return {
-            "content": response.content if isinstance(response, AIMessage) else str(response),
+            "content": response.content if isinstance(response, BaseMessage) else str(response),
             "tool_results": results,
         }
 

@@ -26,6 +26,7 @@ from dotenv import find_dotenv, load_dotenv
 from OpenSSL import crypto as c
 
 from connectchain.utils import Config
+from connectchain.utils.exceptions import NonRetryableError
 
 # There are 3 environment variables that need to be set: CONFIG_PATH:
 # path to the config file Consumer ID: the consumer integration ID.
@@ -35,8 +36,10 @@ from connectchain.utils import Config
 # defined in the config file under eas.secret_key
 
 
-class UtilException(Exception):
-    """Custom exception class for token_util"""
+class UtilException(Exception, NonRetryableError):
+    """Custom exception class for token_util. Raised for permanent config errors
+    (missing models, undefined index, unset env keys) that can never succeed on
+    retry -- see NonRetryableError."""
 
 
 def get_token_from_env(index: Any = "1") -> str:

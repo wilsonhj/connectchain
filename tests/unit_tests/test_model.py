@@ -218,6 +218,91 @@ class TestModel(unittest.TestCase):
             with self.assertRaisesRegex(LCELModelException, "api_version is required") as _:
                 _get_direct_model_(model_config)
 
+    def test_sovereign_cloud_azure_endpoint_detected(self):
+        """CODE-REVIEW regression: Azure US Government / China endpoints
+        (openai.azure.us, openai.azure.cn) must route to the Azure builder like the
+        public cloud, not silently fall through to a plain ChatOpenAI."""
+        for host in ("openai.azure.us", "openai.azure.cn"):
+            with self.subTest(host=host):
+                model_config = wrap_model_config(
+                    {
+                        "provider": "openai",
+                        "model_name": "gpt-4",
+                        "api_base": f"https://my-resource.{host}/",
+                    }
+                )
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+                    # Reaching the api_version guard proves Azure routing happened.
+                    with self.assertRaisesRegex(LCELModelException, "api_version is required"):
+                        _get_direct_model_(model_config)
+
+    def test_explicit_azure_flag_forces_azure_routing(self):
+        """CODE-REVIEW regression: APIM/custom domains can't be detected by hostname;
+        `azure: true` on the model config must force Azure routing explicitly."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_base": "https://llm-gw.mycorp.example/",
+                "azure": True,
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with self.assertRaisesRegex(LCELModelException, "api_version is required"):
+                _get_direct_model_(model_config)
+
+    def test_api_key_env_set_but_unset_var_fails_clearly_on_fast_path(self):
+        """CODE-REVIEW regression: a config that explicitly names api_key_env whose
+        variable is unset must fail with a clear error on the init_chat_model fast
+        path too -- previously the fast path silently proceeded without a key and
+        failed opaquely inside the provider client at call time."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_key_env": "MY_CUSTOM_KEY_VAR_THAT_IS_UNSET",
+            }
+        )
+        env = {k: v for k, v in os.environ.items() if k != "MY_CUSTOM_KEY_VAR_THAT_IS_UNSET"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(LCELModelException, "MY_CUSTOM_KEY_VAR_THAT_IS_UNSET"):
+                _get_direct_model_(model_config)
+
+    def test_temperature_honored_on_manual_fallback_path(self):
+        """CODE-REVIEW regression: configured temperature was only honored on the
+        init_chat_model fast path; the manual fallback ChatOpenAI dropped it."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                # Non-inferable name forces the manual fallback branch.
+                "model_name": "test_model",
+                "temperature": 0.25,
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            result = _get_direct_model_(model_config)
+        self.assertIsInstance(result, ChatOpenAI)
+        self.assertEqual(result.temperature, 0.25)
+
+    def test_unquoted_yaml_date_api_version_is_coerced_to_string(self):
+        """VERIFY finding: YAML parses an unquoted `api_version: 2024-02-01` as a
+        datetime.date, which AzureOpenAI's pydantic validation rejects opaquely.
+        The api_version guard must coerce it so the natural config spelling works."""
+        import datetime  # pylint: disable=import-outside-toplevel
+
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_base": "https://my-resource.openai.azure.com/",
+                "api_version": datetime.date(2024, 2, 1),  # what yaml.safe_load produces
+                "engine": "gpt-4",
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            result = _get_direct_model_(model_config)
+        self.assertIsInstance(result, AzureOpenAI)
+
     @patch("connectchain.lcel.model.ChatOpenAI", return_value=Mock(ChatOpenAI))
     # pylint: disable=unused-argument
     def test_model_eas_chat_missing_api_version_raises_clear_error(self, *args):

@@ -27,6 +27,8 @@ class SessionMap:
     construction completes) guards all session_map reads/writes.
     """
 
+    DEFAULT_EXPIRES_IN: int = 900
+
     _instance: Optional["SessionMap"] = None
     _instance_lock: threading.Lock = threading.Lock()
     _lock: threading.Lock
@@ -34,9 +36,18 @@ class SessionMap:
     # singleton's current value -- a later SessionMap(different_interval) call must not
     # retroactively change the expiry policy for sessions cached under a prior interval.
     session_map: Dict[str, Tuple[datetime, int, LLMResult]] = {}
-    expires_in: int = -1
+    expires_in: int = DEFAULT_EXPIRES_IN
 
-    def __new__(cls, expires_in: int = 900) -> "SessionMap":
+    def __new__(cls, expires_in: Optional[int] = None) -> "SessionMap":
+        """Return the singleton, optionally reconfiguring its default expiry.
+
+        `expires_in=None` (the default) means "don't reconfigure": a bare
+        SessionMap() call -- e.g. constructed just to read the cache -- must not
+        silently reset a previously configured interval back to the default.
+        Passing an explicit value reconfigures the default used for sessions
+        cached from here on; already-cached sessions keep the expires_in they
+        were cached under (captured per-entry in new_session()).
+        """
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
@@ -47,15 +58,16 @@ class SessionMap:
                     # would let that thread skip the lock entirely and use an instance
                     # missing _lock, raising AttributeError.
                     new_instance = super(SessionMap, cls).__new__(cls)
-                    new_instance.expires_in = expires_in
+                    new_instance.expires_in = (
+                        expires_in if expires_in is not None else cls.DEFAULT_EXPIRES_IN
+                    )
                     new_instance._lock = threading.Lock()
                     cls._instance = new_instance
                     return cls._instance
-        # Update on every call, not just the first -- this is a singleton, so a later
-        # caller configuring a different expires_in must not be silently ignored for
-        # sessions it caches from here on. (Already-cached sessions keep their own
-        # expires_in, captured in new_session(), so this doesn't affect them.)
-        cls._instance.expires_in = expires_in
+        if expires_in is not None:
+            # Guarded so the write can't interleave with new_session()'s fallback read.
+            with cls._instance._lock:
+                cls._instance.expires_in = expires_in
         return cls._instance
 
     def new_session(
@@ -68,17 +80,18 @@ class SessionMap:
         point would race a concurrent SessionMap(other_interval) call made by another
         request in between, silently applying the wrong expiry to this session.
         """
-        if expires_in is None:
-            expires_in = self.expires_in
         with self._lock:
+            if expires_in is None:
+                expires_in = self.expires_in
             self.session_map[session_id] = (datetime.now(), expires_in, llm)
 
     @staticmethod
     def _is_stale(entry: Tuple[datetime, int, LLMResult]) -> bool:
         """Whether a cached entry has exceeded the expires_in it was cached under.
 
-        Caller must hold self._lock. Shared by is_expired() and
-        get_valid_llm() so the staleness rule lives in exactly one place.
+        Shared by is_expired() and get_valid_llm() so the staleness rule lives
+        in exactly one place. Pure function of the already-fetched entry tuple;
+        no lock needed.
         """
         cached_at, expires_in, _ = entry
         return (datetime.now() - cached_at).total_seconds() > expires_in
