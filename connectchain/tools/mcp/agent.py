@@ -18,13 +18,15 @@ asynchronous invocation, error handling, and tool result aggregation."""
 
 import asyncio
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-from langchain.schema import AIMessage
 from langchain.schema.runnable import Runnable, RunnableConfig
 from langchain.tools import BaseTool
+from langchain_core.messages import BaseMessage
 
 from ...lcel import model
+
+logger = logging.getLogger(__name__)
 
 
 class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
@@ -36,7 +38,15 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
 
     def __init__(self, model_id: str, tools: List[BaseTool]):
         self.model_id = model_id
-        self.tools = {tool.name: tool for tool in tools}
+        self.tools: Dict[str, BaseTool] = {}
+        for tool in tools:
+            if tool.name in self.tools:
+                logger.warning(
+                    "Duplicate tool name '%s' from multiple servers; the later one "
+                    "overrides the earlier one.",
+                    tool.name,
+                )
+            self.tools[tool.name] = tool
 
     async def ainvoke(
         self,
@@ -52,7 +62,12 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
         response = await llm.ainvoke(input, config)
 
         if not hasattr(response, "tool_calls") or not response.tool_calls:
-            return response
+            # Match the declared `-> dict` contract on every path, not just when tools
+            # are requested -- otherwise callers can't uniformly do result["content"].
+            return {
+                "content": response.content if isinstance(response, BaseMessage) else str(response),
+                "tool_results": [],
+            }
 
         results = []
         for tool_call in response.tool_calls:
@@ -64,15 +79,15 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
                     result = await self.tools[tool_name].ainvoke(tool_args)
                     results.append({"tool": tool_name, "result": result})
                 except Exception as e:  # pylint: disable=broad-except
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "Tool '%s' execution failed: %s", tool_name, e
                     )
                     results.append({"tool": tool_name, "error": str(e)})
             else:
-                logging.getLogger(__name__).warning("Unknown tool requested: %s", tool_name)
+                logger.warning("Unknown tool requested: %s", tool_name)
 
         return {
-            "content": response.content if isinstance(response, AIMessage) else str(response),
+            "content": response.content if isinstance(response, BaseMessage) else str(response),
             "tool_results": results,
         }
 

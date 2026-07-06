@@ -11,7 +11,6 @@
 # the License.
 """Unit testing for SessionMap class — BUG-2 regression suite"""
 import threading
-import time
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
@@ -24,8 +23,9 @@ class TestSessionMap(unittest.TestCase):
     """Unit testing the SessionMap"""
 
     def setUp(self):
-        """Reset singleton between tests."""
-        SessionMap._instance = None
+        """Reset the singleton and its shared cache so tests don't leak state."""
+        SessionMap._instance = None  # pylint: disable=protected-access
+        SessionMap.session_map.clear()
 
     # ── Existing tests (unchanged) ──────────────────────────────────────────
 
@@ -74,13 +74,14 @@ class TestSessionMap(unittest.TestCase):
         self.assertFalse(sm.is_expired("active-session"))
 
     def test_is_expired_stale_session_returns_true(self):
-        """A session whose timestamp is older than expires_in must be expired."""
+        """A session whose timestamp is older than its expires_in must be expired."""
         sm = SessionMap(expires_in=900)
         mock_llm = MagicMock()
         sm.new_session("stale-session", mock_llm)
-        # Backdate the timestamp
+        # Backdate the timestamp (entries are (cached_at, expires_in, llm) tuples)
         sm.session_map["stale-session"] = (
             datetime.now() - timedelta(seconds=1000),
+            900,
             mock_llm,
         )
         self.assertTrue(sm.is_expired("stale-session"))
@@ -135,3 +136,73 @@ class TestSessionMap(unittest.TestCase):
             all(instance is results[0] for instance in results),
             "Concurrent first construction returned more than one distinct instance",
         )
+
+    # ── Per-session expiry regression tests ─────────────────────────────────
+
+    def test_expires_in_is_captured_per_session_not_shared(self):
+        """A session cached under one expires_in must keep its own expiry even after
+        the singleton is later reconstructed with a different interval for another model"""
+        session_map = SessionMap(900)
+        session_map.new_session("long-lived", "llm-1")
+        # Simulate 5 seconds having elapsed since the session was cached.
+        cached_at, expires_in, llm = session_map.session_map["long-lived"]
+        session_map.session_map["long-lived"] = (cached_at - timedelta(seconds=5), expires_in, llm)
+
+        # A later caller resolves a different model configured with a much shorter interval.
+        reconfigured = SessionMap(1)
+        self.assertIs(session_map, reconfigured)
+
+        # The long-lived session was cached under expires_in=900 and must still honor
+        # that, not the most-recently-configured value of 1.
+        self.assertFalse(reconfigured.is_expired("long-lived"))
+
+        # A session cached after the reconfiguration correctly uses the new interval.
+        reconfigured.new_session("short-lived", "llm-2")
+        cached_at, expires_in, llm = reconfigured.session_map["short-lived"]
+        reconfigured.session_map["short-lived"] = (
+            cached_at - timedelta(seconds=5),
+            expires_in,
+            llm,
+        )
+        self.assertTrue(reconfigured.is_expired("short-lived"))
+
+    def test_new_session_uses_explicit_expires_in_not_singleton_value_at_write_time(self):
+        """Regression test for a write-time race: a caller must be able to capture
+        expires_in immediately (e.g. before a slow network call) and have new_session()
+        honor that captured value, even if another caller reconfigures the singleton's
+        shared `expires_in` field in between -- reading self.expires_in only inside
+        new_session() would silently apply the wrong, most-recently-configured interval
+        instead of the one this session was actually meant to use."""
+        session_map = SessionMap(900)
+        captured_expires_in = session_map.expires_in  # captured "before the network call"
+
+        # Another request reconfigures the singleton for a different model in between.
+        SessionMap(1)
+
+        # Passing the captured value explicitly must win over the singleton's current value.
+        session_map.new_session("my-session", "llm-1", captured_expires_in)
+        self.assertEqual(session_map.session_map["my-session"][1], 900)
+
+    def test_bare_construction_does_not_reset_configured_interval(self):
+        """CODE-REVIEW regression: SessionMap() with no argument (e.g. constructed just
+        to read the cache) must NOT silently reset a previously configured interval
+        back to the default."""
+        SessionMap(3600)
+        sm = SessionMap()  # bare read-only construction
+        self.assertEqual(sm.expires_in, 3600)
+        sm.new_session("k", "llm")
+        self.assertEqual(sm.session_map["k"][1], 3600)
+        # An explicit reconfiguration still works.
+        SessionMap(60)
+        self.assertEqual(sm.expires_in, 60)
+
+    def test_missing_token_refresh_interval_uses_default_not_none(self):
+        """CODE-REVIEW regression: a config without eas.token_refresh_interval reaches
+        SessionMap as None (ConfigWrapper returns None for missing keys). That must
+        fall back to the default -- previously the entry cached expires_in=None and
+        every later cache-hit expiry check crashed with TypeError ('>' vs NoneType)."""
+        sm = SessionMap(None)
+        self.assertEqual(sm.expires_in, SessionMap.DEFAULT_EXPIRES_IN)
+        sm.new_session("k", "llm", None)
+        self.assertEqual(sm.session_map["k"][1], SessionMap.DEFAULT_EXPIRES_IN)
+        self.assertFalse(sm.is_expired("k"))  # must not raise TypeError

@@ -57,7 +57,8 @@ class TestMCPToolAgent:
             agent = MCPToolAgent("1", mock_tools)
             result = await agent.ainvoke({"query": "What is 2+2?"})
 
-            assert result.content == "The answer is 42"
+            assert result["content"] == "The answer is 42"
+            assert result["tool_results"] == []
             assert mock_llm.bind_tools.called
 
     @pytest.mark.asyncio

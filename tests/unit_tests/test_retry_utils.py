@@ -14,7 +14,12 @@ import asyncio
 from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, call, patch
 
+from connectchain.utils.exceptions import NonRetryableError
 from connectchain.utils.retry import abase_retry, aretry_decorator, base_retry, retry_decorator
+
+
+class _PermanentError(Exception, NonRetryableError):
+    """Stand-in for LCELModelException/ConfigException in these generic retry tests."""
 
 
 def get_named_mock(*args, use_async=False, **kwargs) -> Mock:
@@ -85,6 +90,30 @@ class TestRetryUtils(TestCase):
             ]
         )
 
+    @patch("connectchain.utils.retry.sleep")
+    def test_base_retry_does_not_retry_nonretryable_error(self, mock_sleep: Mock) -> None:
+        """Regression test: an exception matching the default `exceptions=Exception`
+        filter but marked NonRetryableError (e.g. LCELModelException for a missing
+        API key) must fail on the first attempt, not be retried max_retry times."""
+        mock_func = get_named_mock(side_effect=_PermanentError("permanent config error"))
+        with self.assertRaises(_PermanentError):
+            base_retry(mock_func, max_retry=3, log_func=Mock())
+        self.assertEqual(mock_func.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("connectchain.utils.retry.sleep")
+    def test_base_retry_explicit_optin_overrides_nonretryable_marker(
+        self, mock_sleep: Mock
+    ) -> None:
+        """CODE-REVIEW regression: a caller who EXPLICITLY lists a
+        NonRetryableError-marked type in `exceptions` has asked to retry that
+        family; the marker's fail-fast must not silently override that explicit
+        request (it only applies under the generic default filter)."""
+        mock_func = get_named_mock(side_effect=_PermanentError("flagged but opted in"))
+        with self.assertRaises(_PermanentError):
+            base_retry(mock_func, max_retry=3, exceptions=_PermanentError, log_func=Mock())
+        self.assertEqual(mock_func.call_count, 3)
+
     @patch("connectchain.utils.retry.asyncio.sleep")
     def test_abase_retry(self, mock_sleep: Mock) -> None:
         """Unit test for the abase_retry function."""
@@ -140,6 +169,42 @@ class TestRetryUtils(TestCase):
                 call("Function mock_func failed after 3 attempts."),
             ]
         )
+
+    @patch("connectchain.utils.retry.asyncio.sleep")
+    def test_abase_retry_does_not_retry_nonretryable_error(self, mock_sleep: Mock) -> None:
+        """Async counterpart of test_base_retry_does_not_retry_nonretryable_error."""
+        mock_func = get_named_mock(use_async=True, side_effect=_PermanentError("permanent"))
+        with self.assertRaises(_PermanentError):
+            asyncio.run(abase_retry(mock_func, max_retry=3, log_func=Mock()))
+        self.assertEqual(mock_func.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("connectchain.utils.retry.asyncio.sleep")
+    def test_abase_retry_explicit_optin_overrides_nonretryable_marker(
+        self, mock_sleep: Mock
+    ) -> None:
+        """Async counterpart of test_base_retry_explicit_optin_overrides_nonretryable_marker."""
+        mock_func = get_named_mock(use_async=True, side_effect=_PermanentError("opted in"))
+        with self.assertRaises(_PermanentError):
+            asyncio.run(
+                abase_retry(mock_func, max_retry=3, exceptions=_PermanentError, log_func=Mock())
+            )
+        self.assertEqual(mock_func.call_count, 3)
+
+    def test_util_exception_is_nonretryable(self) -> None:
+        """CODE-REVIEW regression: UtilException raises for permanent config errors
+        (missing models, unset env keys) and must carry the NonRetryableError marker
+        like its siblings (LCELModelException, ConfigException) -- otherwise a
+        retry-wrapped get_token_from_env() burns max_retry attempts on an error
+        that can never succeed."""
+        from connectchain.utils.token_util import UtilException  # pylint: disable=import-outside-toplevel
+
+        self.assertTrue(issubclass(UtilException, NonRetryableError))
+        self.assertTrue(issubclass(UtilException, Exception))
+        mock_func = get_named_mock(side_effect=UtilException("No models defined in config"))
+        with self.assertRaises(UtilException):
+            base_retry(mock_func, max_retry=3, sleep_time=0, log_func=Mock())
+        self.assertEqual(mock_func.call_count, 1)
 
     def test_retry_decorator(self) -> None:
         """Unit test for the retry_decorator function."""

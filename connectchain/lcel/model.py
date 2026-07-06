@@ -19,6 +19,7 @@ from langchain_openai import AzureOpenAI, ChatOpenAI
 from pydantic import SecretStr
 
 from connectchain.utils import Config, SessionMap, get_token_from_env
+from connectchain.utils.exceptions import NonRetryableError
 from connectchain.utils.llm_proxy_wrapper import wrap_llm_with_proxy
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,9 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_PROVIDERS = ("openai", "anthropic", "google", "cohere", "huggingface")
 
 
-class LCELModelException(BaseException):
-    """Base exception for the LCEL model"""
+class LCELModelException(Exception, NonRetryableError):
+    """Base exception for the LCEL model. A missing config/API key/provider will never
+    succeed on retry -- see NonRetryableError."""
 
 
 def model(index: Any = "1") -> BaseLanguageModel:
@@ -90,21 +92,41 @@ def _get_model_(index: Any) -> BaseLanguageModel:
 def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLanguageModel:
     """Get the OpenAI LLM instance"""
     model_session_key = SessionMap.uuid_from_config(config, model_config)
-    session_map = SessionMap(config.eas.token_refresh_interval)
+    # Captured now, before any I/O below, and passed explicitly to new_session() --
+    # reading session_map.expires_in again after get_token_from_env()'s network call
+    # would race a concurrent request that reconstructs the singleton for a different
+    # model's token_refresh_interval in between.
+    expires_in = config.eas.token_refresh_interval
+    session_map = SessionMap(expires_in)
     if os.getenv(model_session_key) is not None:
         # get_valid_llm() combines the expiry check and cache read into a single
         # locked operation instead of two (is_expired() then get_llm()).
-        cached_llm = session_map.get_valid_llm(model_session_key)  # type: ignore[assignment]
+        cached_llm = session_map.get_valid_llm(model_session_key)
         if cached_llm is not None:
-            return cached_llm
+            # Note: SessionMap is typed for LLMResult but we store LLM instances
+            return cached_llm  # type: ignore[return-value]
     auth_token = get_token_from_env(index)
     os.environ[model_session_key] = auth_token
     if model_config.type == "chat":
         llm: BaseLanguageModel = _get_chat_model_(auth_token, model_config)
     else:
         llm = _get_azure_model_(auth_token, model_config)
-    session_map.new_session(model_session_key, llm)  # type: ignore[arg-type]
+    session_map.new_session(model_session_key, llm, expires_in)  # type: ignore[arg-type]
     return llm
+
+
+# Azure OpenAI endpoint domains: public cloud, US Government, and China sovereign
+# clouds. APIM/custom domains can't be detected by hostname -- configs using one
+# should set `azure: true` on the model entry instead.
+_AZURE_ENDPOINT_MARKERS = ("openai.azure.com", "openai.azure.us", "openai.azure.cn")
+
+
+def _is_azure_endpoint_(model_config: Any, api_base: Any) -> bool:
+    """Whether this config targets Azure OpenAI: either an api_base on a known
+    Azure domain, or an explicit `azure: true` flag for custom/APIM domains."""
+    if getattr(model_config, "azure", None):
+        return True
+    return bool(api_base) and any(m in str(api_base) for m in _AZURE_ENDPOINT_MARKERS)
 
 
 def _require_api_version_(model_config: Any, api_base: Any) -> Any:
@@ -121,7 +143,18 @@ def _require_api_version_(model_config: Any, api_base: Any) -> Any:
             f"Azure OpenAI endpoint detected ({api_base}) but no api_version is "
             f"configured; api_version is required for Azure OpenAI."
         )
-    return api_version
+    # YAML parses an unquoted `api_version: 2024-02-01` as datetime.date, which the
+    # AzureOpenAI/ChatOpenAI pydantic validators reject with an opaque error. Coerce
+    # so both the quoted and the natural unquoted config spelling work.
+    return str(api_version)
+
+
+def _temperature_kwargs_(model_config: Any) -> dict:
+    """{'temperature': t} when configured, else {} -- so an unset temperature keeps
+    each provider's own default instead of being forced to None. Checked via the
+    resolved value (not hasattr) for the same ConfigWrapper reason as elsewhere."""
+    temperature = getattr(model_config, "temperature", None)
+    return {} if temperature is None else {"temperature": temperature}
 
 
 def _azure_model_kwargs_(engine: Any) -> dict:
@@ -139,13 +172,10 @@ def _get_chat_model_(auth_token: str, model_config: Any) -> ChatOpenAI:
         model=model_config.model_name,
         api_key=SecretStr(auth_token) if auth_token else None,
         base_url=model_config.api_base,
-        # api_version stays inside model_kwargs here (unlike _get_azure_model_ /
+        # api_version goes inside model_kwargs here (unlike _get_azure_model_ /
         # _get_direct_azure_model_) because ChatOpenAI has no top-level api_version kwarg.
-        model_kwargs={
-            "engine": model_config.engine,
-            "api_version": api_version,
-            "api_type": "azure",
-        },
+        model_kwargs={**_azure_model_kwargs_(model_config.engine), "api_version": api_version},
+        **_temperature_kwargs_(model_config),
     )
 
 
@@ -158,6 +188,7 @@ def _get_azure_model_(auth_token: str, model_config: Any) -> AzureOpenAI:
         azure_endpoint=model_config.api_base,
         api_version=api_version,
         model_kwargs=_azure_model_kwargs_(model_config.engine),
+        **_temperature_kwargs_(model_config),
     )
 
 
@@ -178,6 +209,7 @@ def _get_direct_azure_model_(model_config: Any, api_key: str, api_base: Any) -> 
         azure_endpoint=api_base,
         api_version=api_version,
         model_kwargs=_azure_model_kwargs_(engine),
+        **_temperature_kwargs_(model_config),
     )
 
 
@@ -186,6 +218,7 @@ def _resolve_direct_api_key_(model_config: Any) -> str:
     provider-default environment variable, raising a clear error if unset."""
     api_key_env = getattr(model_config, "api_key_env", None)
     if not api_key_env:
+        # Default to {PROVIDER}_API_KEY pattern
         api_key_env = f"{model_config.provider.upper()}_API_KEY"
 
     api_key = os.getenv(api_key_env)
@@ -212,10 +245,29 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     # it would silently succeed with a plain, non-Azure ChatOpenAI instead of a working
     # (or clearly failing) Azure client.
     api_base = getattr(model_config, "api_base", None)
-    is_azure = model_config.provider == "openai" and api_base and "openai.azure.com" in str(api_base)
-    if is_azure:
+    if model_config.provider == "openai" and _is_azure_endpoint_(model_config, api_base):
         azure_api_key = _resolve_direct_api_key_(model_config)
         return _get_direct_azure_model_(model_config, azure_api_key, api_base)
+
+    # Add temperature if specified. Note: getattr's default is never returned here
+    # because ConfigWrapper.__getattr__ returns None (not AttributeError) for a
+    # missing key, so we must check the resolved value instead of using hasattr().
+    temperature = getattr(model_config, "temperature", None)
+
+    # Resolved before the try block: raising inside it would be caught by the
+    # `except Exception` below and re-wrapped as an "unexpected" init error.
+    api_key_env = getattr(model_config, "api_key_env", None)
+    explicit_api_key = None
+    if api_key_env:
+        explicit_api_key = os.getenv(api_key_env)
+        if not explicit_api_key:
+            # The config explicitly names an env var; silently proceeding without
+            # a key would fail opaquely inside the provider client later. Match
+            # the manual fallback path's behavior and fail clearly now.
+            raise LCELModelException(
+                f"API key not found in environment variable: {api_key_env}. "
+                f"Please set it in your .env file or environment."
+            )
 
     try:
         from langchain.chat_models import init_chat_model  # pylint: disable=import-outside-toplevel
@@ -225,14 +277,10 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
 
         if hasattr(model_config, "api_base") and model_config.api_base:
             config_dict["base_url"] = model_config.api_base
-        if hasattr(model_config, "temperature"):
-            config_dict["temperature"] = model_config.temperature
-
-        api_key_env = getattr(model_config, "api_key_env", None)
-        if api_key_env:
-            api_key = os.getenv(api_key_env)
-            if api_key:
-                config_dict["api_key"] = api_key
+        if temperature is not None:
+            config_dict["temperature"] = temperature
+        if explicit_api_key:
+            config_dict["api_key"] = explicit_api_key
 
         return init_chat_model(model_name, **config_dict)
 
@@ -267,7 +315,8 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         return ChatOpenAI(
             model=model_config.model_name,
             api_key=api_key,
-            base_url=api_base,
+            base_url=api_base,  # Can be None for default OpenAI endpoint
+            **_temperature_kwargs_(model_config),
         )
 
     elif model_config.provider == "anthropic":
@@ -278,6 +327,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 model=model_config.model_name,
                 anthropic_api_key=api_key,
                 anthropic_api_url=getattr(model_config, "api_base", None),
+                **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
             raise LCELModelException(
@@ -293,6 +343,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             return ChatGoogleGenerativeAI(
                 model=model_config.model_name,
                 google_api_key=api_key,
+                **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
             raise LCELModelException(
@@ -306,6 +357,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             return ChatCohere(
                 model=model_config.model_name,
                 cohere_api_key=api_key,
+                **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
             raise LCELModelException(
