@@ -122,6 +122,42 @@ class TestModel(unittest.TestCase):
             result = _get_direct_model_(model_config)
         self.assertIsInstance(result, ChatOpenAI)
 
+    def test_get_direct_model_safe_message_when_model_name_raises(self):
+        """If the original failure inside _get_direct_model_'s try block was itself
+        model_config.model_name raising AttributeError (a malformed config missing
+        that attribute), the except-Exception handler's error message must not
+        re-access that same attribute -- doing so would raise a second, uncaught
+        AttributeError instead of the intended clean LCELModelException."""
+
+        class _ModelNameRaises:
+            provider = "openai"
+
+            @property
+            def model_name(self):
+                raise AttributeError("model_name is not available")
+
+        with self.assertRaisesRegex(
+            LCELModelException, "Unexpected error initialising model"
+        ) as cm:
+            _get_direct_model_(_ModelNameRaises())
+        self.assertIsInstance(cm.exception.__cause__, AttributeError)
+
+    @patch("connectchain.lcel.model.logger")
+    @patch("langchain.chat_models.init_chat_model")
+    def test_unsupported_provider_does_not_log_fallback_warning(
+        self, mock_init_chat_model, mock_logger
+    ):
+        """An unsupported provider must be rejected BEFORE init_chat_model() is ever
+        attempted, so the misleading 'falling back to manual provider init' warning
+        never fires ahead of the correct 'not supported' error."""
+        model_config = wrap_model_config(
+            {**get_mock_config().data["models"]["1"], "provider": "meta"}
+        )
+        with self.assertRaisesRegex(LCELModelException, "not supported"):
+            _get_direct_model_(model_config)
+        mock_init_chat_model.assert_not_called()
+        mock_logger.warning.assert_not_called()
+
     def test_model_azure_endpoint_without_api_version_raises(self):
         """An Azure-shaped api_base without api_version must fail loudly instead of
         silently falling back to a non-Azure ChatOpenAI client pointed at Azure."""
