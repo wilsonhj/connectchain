@@ -38,8 +38,19 @@ from connectchain.utils.exceptions import NonRetryableError
 
 class UtilException(Exception, NonRetryableError):
     """Custom exception class for token_util. Raised for permanent config errors
-    (missing models, undefined index, unset env keys) that can never succeed on
-    retry -- see NonRetryableError."""
+    (missing models, undefined index, unset env keys, expired cert) that can
+    never succeed on retry -- see NonRetryableError."""
+
+
+class EASAuthError(Exception):
+    """Raised when a call to the EAS auth service fails (any non-200 response).
+
+    Deliberately a plain, retry-eligible Exception -- NOT a UtilException --
+    because the retryability of an auth-service failure is unknown at raise
+    time: a transient 5xx or throttling response may well succeed on retry.
+    UtilException carries the NonRetryableError marker (it is reserved for
+    permanent config errors), so raising it here would make retry-wrapped
+    token fetches fail fast on recoverable server errors."""
 
 
 def get_token_from_env(index: Any = "1") -> str:
@@ -184,7 +195,10 @@ class TokenUtil:
     def __response_builder(out: Any, status_code: int) -> str:
         if status_code == 200:
             return f"Bearer {out['authorization_token']}"
-        raise UtilException(out["description"])
+        # Non-200 from the auth service may be transient (5xx, throttling), so
+        # raise the retry-eligible EASAuthError rather than the
+        # NonRetryableError-marked UtilException -- see EASAuthError.
+        raise EASAuthError(out["description"])
 
     def __get_signature(self, version: str, timestamp: int) -> str:
         message = f"{self.consumer_id}-{version}-{str(timestamp)}"

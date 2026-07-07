@@ -29,11 +29,18 @@ def _fail_fast_(
     on retry. But a caller who EXPLICITLY lists a NonRetryableError-marked type
     in `exceptions` has opted into retrying that family, and that explicit
     request wins over the marker.
+
+    The opt-in is strictly PER-FAMILY: fail-fast is skipped only when the
+    caught error is an instance of an explicitly-listed type that is itself
+    NonRetryableError-marked. Listing one marked type (e.g.
+    `exceptions=(ConfigException, Exception)`) must not silently re-enable
+    retries for every other marked exception that merely matches a broader
+    entry like `Exception` -- those unrelated permanent errors still fail fast.
     """
     if not isinstance(error, NonRetryableError):
         return False
     exc_types = exceptions if isinstance(exceptions, tuple) else (exceptions,)
-    return not any(issubclass(t, NonRetryableError) for t in exc_types)
+    return not any(issubclass(t, NonRetryableError) and isinstance(error, t) for t in exc_types)
 
 
 def base_retry(  # pylint: disable=too-many-arguments, too-many-positional-arguments

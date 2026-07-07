@@ -79,6 +79,10 @@ class SessionMap:
         anything slow (e.g. a network call): reading self.expires_in only at this
         point would race a concurrent SessionMap(other_interval) call made by another
         request in between, silently applying the wrong expiry to this session.
+        The None-fallback below is retained only for backward compatibility with
+        external callers; connectchain's own call sites always pass an explicit
+        int (resolving an unset config interval to DEFAULT_EXPIRES_IN at capture
+        time) precisely so this racy read is never exercised.
         """
         with self._lock:
             if expires_in is None:
