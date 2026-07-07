@@ -96,6 +96,11 @@ class TestSessionMap(unittest.TestCase):
         with self._lock removed entirely). This drives the real scenario the
         lock protects: new_session() (writer) racing is_expired()/
         get_valid_llm()/get_llm() (readers) on one shared key.
+
+        Note: on GIL CPython, single dict store/get operations are atomic, so
+        this test may still pass with the lock removed; its teeth are as a
+        contract/regression test if these methods ever become compound
+        (multi-step) mutations, and on free-threaded (no-GIL) builds.
         """
         sm = SessionMap(expires_in=900)
         key = "concurrent-key"
