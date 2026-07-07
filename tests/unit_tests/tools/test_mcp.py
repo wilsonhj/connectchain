@@ -128,6 +128,26 @@ class TestMCPToolAgent:
             assert result["tool_results"][0]["tool"] == "add"
             assert result["tool_results"][0]["error"] == "Tool failed"
 
+    @pytest.mark.asyncio
+    async def test_kwargs_forwarded_to_llm(self, mock_tools):
+        """Regression test: caller-supplied kwargs must reach the underlying llm.ainvoke.
+
+        Previously ainvoke accepted **kwargs but never forwarded them, so run
+        options (e.g. `stop`) were silently dropped."""
+        with patch("connectchain.tools.mcp.agent.model") as mock_model:
+            mock_llm = AsyncMock()
+            mock_response = AIMessage(content="The answer is 42")
+            mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+            mock_llm.bind_tools = Mock(return_value=mock_llm)
+            mock_model.return_value = mock_llm
+
+            agent = MCPToolAgent("1", mock_tools)
+            await agent.ainvoke({"query": "What is 2+2?"}, None, stop=["\n"], temperature=0.1)
+
+            mock_llm.ainvoke.assert_awaited_once_with(
+                {"query": "What is 2+2?"}, None, stop=["\n"], temperature=0.1
+            )
+
     def test_invoke_runtime_error(self, mock_tools):
         """Test synchronous invoke raises RuntimeError with helpful message."""
         with patch("connectchain.tools.mcp.agent.asyncio.run") as mock_asyncio_run:

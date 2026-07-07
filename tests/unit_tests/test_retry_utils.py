@@ -22,6 +22,12 @@ class _PermanentError(Exception, NonRetryableError):
     """Stand-in for LCELModelException/ConfigException in these generic retry tests."""
 
 
+class _UnrelatedPermanentError(Exception, NonRetryableError):
+    """A second, unrelated NonRetryableError-marked family. Used to prove the
+    explicit opt-in is per-family: opting THIS family into retries must not
+    disable fail-fast for _PermanentError (and vice versa)."""
+
+
 def get_named_mock(*args, use_async=False, **kwargs) -> Mock:
     """Return a mock object."""
     mock = (AsyncMock if use_async else Mock)(*args, **kwargs)
@@ -114,6 +120,50 @@ class TestRetryUtils(TestCase):
             base_retry(mock_func, max_retry=3, exceptions=_PermanentError, log_func=Mock())
         self.assertEqual(mock_func.call_count, 3)
 
+    @patch("connectchain.utils.retry.sleep")
+    def test_base_retry_nonretryable_optin_is_per_family(self, mock_sleep: Mock) -> None:
+        """CODE-REVIEW regression: the explicit opt-in must be PER-FAMILY.
+        `exceptions=(_UnrelatedPermanentError, Exception)` opts only
+        _UnrelatedPermanentError into retries; a _PermanentError caught via the
+        broad `Exception` entry is NOT covered by that opt-in and must still
+        fail fast on the first attempt."""
+        mock_func = get_named_mock(side_effect=_PermanentError("not the opted-in family"))
+        with self.assertRaises(_PermanentError):
+            base_retry(
+                mock_func,
+                max_retry=3,
+                exceptions=(_UnrelatedPermanentError, Exception),
+                log_func=Mock(),
+            )
+        self.assertEqual(mock_func.call_count, 1)
+        mock_sleep.assert_not_called()
+
+        # The family that WAS explicitly listed is retried, even alongside the
+        # broad Exception entry -- the opt-in applies to it and only it.
+        mock_func = get_named_mock(side_effect=_UnrelatedPermanentError("opted-in family"))
+        with self.assertRaises(_UnrelatedPermanentError):
+            base_retry(
+                mock_func,
+                max_retry=3,
+                exceptions=(_UnrelatedPermanentError, Exception),
+                log_func=Mock(),
+            )
+        self.assertEqual(mock_func.call_count, 3)
+
+        # And an UNMARKED exception caught via the broad entry keeps normal
+        # retry behavior -- fail-fast only ever applies to marked families.
+        mock_func = get_named_mock(side_effect=[ValueError("transient"), 42])
+        self.assertEqual(
+            base_retry(
+                mock_func,
+                max_retry=3,
+                exceptions=(_UnrelatedPermanentError, Exception),
+                log_func=Mock(),
+            ),
+            42,
+        )
+        self.assertEqual(mock_func.call_count, 2)
+
     @patch("connectchain.utils.retry.asyncio.sleep")
     def test_abase_retry(self, mock_sleep: Mock) -> None:
         """Unit test for the abase_retry function."""
@@ -190,6 +240,24 @@ class TestRetryUtils(TestCase):
                 abase_retry(mock_func, max_retry=3, exceptions=_PermanentError, log_func=Mock())
             )
         self.assertEqual(mock_func.call_count, 3)
+
+    @patch("connectchain.utils.retry.asyncio.sleep")
+    def test_abase_retry_nonretryable_optin_is_per_family(self, mock_sleep: Mock) -> None:
+        """Async counterpart of test_base_retry_nonretryable_optin_is_per_family."""
+        mock_func = get_named_mock(
+            use_async=True, side_effect=_PermanentError("not the opted-in family")
+        )
+        with self.assertRaises(_PermanentError):
+            asyncio.run(
+                abase_retry(
+                    mock_func,
+                    max_retry=3,
+                    exceptions=(_UnrelatedPermanentError, Exception),
+                    log_func=Mock(),
+                )
+            )
+        self.assertEqual(mock_func.call_count, 1)
+        mock_sleep.assert_not_called()
 
     def test_util_exception_is_nonretryable(self) -> None:
         """CODE-REVIEW regression: UtilException raises for permanent config errors

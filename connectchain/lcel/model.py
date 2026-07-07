@@ -13,6 +13,7 @@
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 from langchain.schema.language_model import BaseLanguageModel
 from langchain_openai import AzureOpenAI, ChatOpenAI
@@ -27,9 +28,25 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_PROVIDERS = ("openai", "anthropic", "google", "cohere", "huggingface")
 
 
-class LCELModelException(Exception, NonRetryableError):
-    """Base exception for the LCEL model. A missing config/API key/provider will never
-    succeed on retry -- see NonRetryableError."""
+class LCELModelException(Exception):
+    """Base exception for the LCEL model.
+
+    Deliberately NOT marked NonRetryableError: this base class also wraps
+    UNEXPECTED model-initialisation failures (see _get_direct_model_'s broad
+    except) whose retryability is unknown -- e.g. a transient network or
+    provider outage surfacing inside init_chat_model() -- so retry wrappers
+    (connectchain.utils.retry) must stay free to retry it. Known-permanent
+    configuration problems raise LCELModelConfigError instead; `except
+    LCELModelException` still catches both via the subclass relationship.
+    """
+
+
+class LCELModelConfigError(LCELModelException, NonRetryableError):
+    """A permanent configuration problem with the LCEL model: missing config
+    entry, unset API-key env var, unsupported provider, missing api_version,
+    or an uninstalled provider package. These will never succeed on retry, so
+    the NonRetryableError marker tells connectchain.utils.retry's wrappers to
+    re-raise immediately instead of burning retry attempts on nothing."""
 
 
 def model(index: Any = "1") -> BaseLanguageModel:
@@ -47,10 +64,10 @@ def _get_model_(index: Any) -> BaseLanguageModel:
     try:
         models = config.models
     except KeyError as ex:
-        raise LCELModelException("No models defined in config") from ex
+        raise LCELModelConfigError("No models defined in config") from ex
     model_config = models[index]
     if model_config is None:
-        raise LCELModelException(f'Model config at index "{index}" is not defined')
+        raise LCELModelConfigError(f'Model config at index "{index}" is not defined')
 
     needs_eas = False
     try:
@@ -74,7 +91,7 @@ def _get_model_(index: Any) -> BaseLanguageModel:
         model_instance = _get_direct_model_(model_config)
 
     if model_instance is None:
-        raise LCELModelException("Not implemented")
+        raise LCELModelConfigError("Not implemented")
     try:
         proxy_config = model_config.proxy
     except KeyError:
@@ -92,11 +109,17 @@ def _get_model_(index: Any) -> BaseLanguageModel:
 def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLanguageModel:
     """Get the OpenAI LLM instance"""
     model_session_key = SessionMap.uuid_from_config(config, model_config)
-    # Captured now, before any I/O below, and passed explicitly to new_session() --
-    # reading session_map.expires_in again after get_token_from_env()'s network call
-    # would race a concurrent request that reconstructs the singleton for a different
-    # model's token_refresh_interval in between.
+    # Captured AND fully resolved now, before any I/O below, then passed explicitly
+    # to new_session() -- reading session_map.expires_in again after
+    # get_token_from_env()'s network call would race a concurrent request that
+    # reconstructs the singleton for a different model's token_refresh_interval in
+    # between. Resolving an unset token_refresh_interval (None) to the default HERE
+    # matters for the same reason: passing None would make new_session() fall back
+    # to the singleton's CURRENT expires_in after the network call, reopening the
+    # race and inheriting whatever interval another model configured last.
     expires_in = config.eas.token_refresh_interval
+    if expires_in is None:
+        expires_in = SessionMap.DEFAULT_EXPIRES_IN
     session_map = SessionMap(expires_in)
     if os.getenv(model_session_key) is not None:
         # get_valid_llm() combines the expiry check and cache read into a single
@@ -122,11 +145,35 @@ _AZURE_ENDPOINT_MARKERS = ("openai.azure.com", "openai.azure.us", "openai.azure.
 
 
 def _is_azure_endpoint_(model_config: Any, api_base: Any) -> bool:
-    """Whether this config targets Azure OpenAI: either an api_base on a known
-    Azure domain, or an explicit `azure: true` flag for custom/APIM domains."""
+    """Whether this config targets Azure OpenAI: either an api_base whose HOSTNAME is
+    on a known Azure domain, or an explicit `azure: true` flag for custom/APIM domains.
+
+    The hostname is extracted with urlparse and suffix-matched (exact host or a
+    subdomain, i.e. host == marker or host.endswith("." + marker)) rather than
+    substring-matched over the whole URL: a substring match would misroute lookalikes
+    such as https://myproxy.corp.com/openai.azure.com-compat (marker in the path) or
+    https://notopenai.azure.com.evil.example (marker embedded in a non-Azure host)
+    to the Azure builder.
+    """
     if getattr(model_config, "azure", None):
         return True
-    return bool(api_base) and any(m in str(api_base) for m in _AZURE_ENDPOINT_MARKERS)
+    if not api_base:
+        return False
+    parsed = urlparse(str(api_base))
+    hostname = parsed.hostname
+    if hostname is None:
+        # urlparse quirk: a scheme-less value like "my-resource.openai.azure.com/x"
+        # parses entirely into .path with no hostname. Re-parse as network-relative
+        # ("//host/...") so a scheme-less Azure api_base is still recognised as
+        # Azure instead of silently falling through to a plain OpenAI client.
+        hostname = urlparse(f"//{api_base}").hostname
+    if not hostname:
+        return False
+    # urlparse lowercases .hostname, so the comparison is already case-insensitive.
+    return any(
+        hostname == marker or hostname.endswith(f".{marker}")
+        for marker in _AZURE_ENDPOINT_MARKERS
+    )
 
 
 def _require_api_version_(model_config: Any, api_base: Any) -> Any:
@@ -139,7 +186,7 @@ def _require_api_version_(model_config: Any, api_base: Any) -> Any:
     """
     api_version = getattr(model_config, "api_version", None)
     if not api_version:
-        raise LCELModelException(
+        raise LCELModelConfigError(
             f"Azure OpenAI endpoint detected ({api_base}) but no api_version is "
             f"configured; api_version is required for Azure OpenAI."
         )
@@ -223,7 +270,7 @@ def _resolve_direct_api_key_(model_config: Any) -> str:
 
     api_key = os.getenv(api_key_env)
     if not api_key:
-        raise LCELModelException(
+        raise LCELModelConfigError(
             f"API key not found in environment variable: {api_key_env}. "
             f"Please set it in your .env file or environment."
         )
@@ -234,10 +281,14 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     """Get a direct API model instance for any provider without EAS authentication.
 
     ImportError and ValueError from init_chat_model() are expected fallback
-    conditions (missing provider package or bad model name): logged as a
-    warning, then falls through to the manual provider init below. Any other
-    exception is unexpected and is re-raised as LCELModelException with the
-    original traceback preserved via `raise ... from e`.
+    conditions (missing provider package, bad model name, or init_chat_model
+    itself unavailable on an old langchain): for providers with a manual
+    initialisation branch below (_SUPPORTED_PROVIDERS) they are logged as a
+    warning and fall through to that manual init; for any other provider there
+    is nothing to fall back to, so a clear LCELModelConfigError is raised
+    instead of the misleading fallback warning. Any other exception is
+    unexpected and is re-raised as (retry-eligible) LCELModelException with
+    the original traceback preserved via `raise ... from e`.
     """
     # Azure-shaped configs are routed straight to a dedicated Azure builder, BEFORE the
     # generic init_chat_model() fast path below is ever attempted. init_chat_model() has
@@ -249,35 +300,29 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         azure_api_key = _resolve_direct_api_key_(model_config)
         return _get_direct_azure_model_(model_config, azure_api_key, api_base)
 
-    if model_config.provider not in _SUPPORTED_PROVIDERS:
-        # Reject unsupported providers before attempting init_chat_model(), so a
-        # genuinely unsupported provider fails fast with the correct "not supported"
-        # error instead of first emitting a misleading "falling back to manual
-        # provider init" warning (or, if init_chat_model() happens not to raise for
-        # an unrecognised provider name, silently succeeding with the wrong model).
-        raise LCELModelException(
-            f"Provider '{model_config.provider}' not supported. "
-            f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
-        )
-
     # Add temperature if specified. Note: getattr's default is never returned here
     # because ConfigWrapper.__getattr__ returns None (not AttributeError) for a
     # missing key, so we must check the resolved value instead of using hasattr().
     temperature = getattr(model_config, "temperature", None)
 
-    # Resolved before the try block: raising inside it would be caught by the
-    # `except Exception` below and re-wrapped as an "unexpected" init error.
+    # Resolved before the try block so the env lookup can't be mistaken for an
+    # "unexpected" init error by the `except Exception` below.
     api_key_env = getattr(model_config, "api_key_env", None)
     explicit_api_key = None
     if api_key_env:
         explicit_api_key = os.getenv(api_key_env)
         if not explicit_api_key:
-            # The config explicitly names an env var; silently proceeding without
-            # a key would fail opaquely inside the provider client later. Match
-            # the manual fallback path's behavior and fail clearly now.
-            raise LCELModelException(
-                f"API key not found in environment variable: {api_key_env}. "
-                f"Please set it in your .env file or environment."
+            # The config names an env var that isn't set. Don't fail hard here:
+            # init_chat_model() resolves the provider's own default env var (e.g.
+            # OPENAI_API_KEY) when no explicit api_key is passed, which may well
+            # work. Surface the misconfiguration loudly, then proceed without an
+            # explicit key. (The manual fallback path below still fails clearly
+            # via _resolve_direct_api_key_ if no key is resolvable at all.)
+            logger.warning(
+                "api_key_env is set to '%s' but that environment variable is unset; "
+                "falling back to the provider's default API-key environment variable "
+                "resolution.",
+                api_key_env,
             )
 
     try:
@@ -292,11 +337,33 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             config_dict["temperature"] = temperature
         if explicit_api_key:
             config_dict["api_key"] = explicit_api_key
+        if model_config.provider not in _SUPPORTED_PROVIDERS:
+            # Providers without a manual fallback branch below (mistralai, groq,
+            # ollama, bedrock, ...) are still served by init_chat_model(). For
+            # these, the configured provider is passed explicitly rather than
+            # inferred from model_name, so a genuinely unknown provider fails
+            # right here with init_chat_model()'s clear "Unsupported
+            # model_provider=..." ValueError instead of silently constructing a
+            # model for whatever provider the name happens to infer to (e.g.
+            # provider 'meta' with model_name 'gpt-4' must not build a ChatOpenAI).
+            config_dict["model_provider"] = model_config.provider
 
         return init_chat_model(model_name, **config_dict)
 
     except (ImportError, ValueError) as e:
-        # Expected: missing provider package or unrecognised model name.
+        # Expected: missing provider package, unrecognised model/provider name, or
+        # init_chat_model itself unavailable.
+        if model_config.provider not in _SUPPORTED_PROVIDERS:
+            # No manual initialisation branch exists for this provider, so the
+            # "falling back" warning below would be misleading -- there is nothing
+            # to fall back to. Fail fast with a clear error instead; the chained
+            # original (`from e`) explains WHY the fast path refused it (unknown
+            # provider vs. an uninstalled provider package).
+            raise LCELModelConfigError(
+                f"Provider '{model_config.provider}' not supported "
+                f"({type(e).__name__}: {e}). Providers with a built-in fallback: "
+                f"{', '.join(_SUPPORTED_PROVIDERS)}"
+            ) from e
         # Log and fall through to the manual initialisation block below.
         logger.warning(
             "init_chat_model() failed for '%s' (%s: %s); falling back to manual provider init.",
@@ -305,7 +372,10 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             e,
         )
     except Exception as e:  # pylint: disable=broad-except
-        # Unexpected failure: preserve the original traceback. Use getattr for the
+        # Unexpected failure: preserve the original traceback. Wrapped as the plain
+        # (retry-eligible) LCELModelException, NOT LCELModelConfigError: the cause
+        # here is by definition unknown -- it may be a transient network/provider
+        # error -- so it must not be branded never-retryable. Use getattr for the
         # model name so constructing this message can never raise a second, uncaught
         # exception (e.g. when the original failure was model_config.model_name itself
         # raising AttributeError on a malformed config).
@@ -337,7 +407,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
-            raise LCELModelException(
+            raise LCELModelConfigError(
                 "langchain-anthropic not installed. Run: pip install langchain-anthropic"
             ) from exc
 
@@ -353,7 +423,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
-            raise LCELModelException(
+            raise LCELModelConfigError(
                 "langchain-google-genai not installed. Run: pip install langchain-google-genai"
             ) from exc
 
@@ -367,7 +437,7 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
-            raise LCELModelException(
+            raise LCELModelConfigError(
                 "langchain-cohere not installed. Run: pip install langchain-cohere"
             ) from exc
 
@@ -381,12 +451,15 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
                 repo_id=model_config.model_name,
                 huggingfacehub_api_token=api_key,
                 endpoint_url=getattr(model_config, "api_base", None),
+                **_temperature_kwargs_(model_config),
             )
         except ImportError as exc:
-            raise LCELModelException(
+            raise LCELModelConfigError(
                 "langchain-huggingface not installed. Run: pip install langchain-huggingface"
             ) from exc
 
     # Defensive: fires only if a provider is added to _SUPPORTED_PROVIDERS without a
     # matching branch above; also satisfies mypy's non-exhaustive-return check.
-    raise LCELModelException(f"No initialisation branch for provider '{model_config.provider}'")
+    raise LCELModelConfigError(
+        f"No initialisation branch for provider '{model_config.provider}'"
+    )

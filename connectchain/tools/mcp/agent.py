@@ -59,7 +59,9 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
         if hasattr(llm, "bind_tools"):
             llm = llm.bind_tools(list(self.tools.values()))
 
-        response = await llm.ainvoke(input, config)
+        # Forward **kwargs so caller-supplied run options (e.g. `stop`, provider-specific
+        # parameters) actually reach the underlying model instead of being silently dropped.
+        response = await llm.ainvoke(input, config, **kwargs)
 
         if not hasattr(response, "tool_calls") or not response.tool_calls:
             # Match the declared `-> dict` contract on every path, not just when tools
