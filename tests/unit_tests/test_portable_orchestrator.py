@@ -163,6 +163,29 @@ class TestPortableOrchestrator(unittest.TestCase):
                     response = orchestrator.run_sync("test_query")
                 self.assertEqual(response, expected)
 
+    def test_extract_output_warns_when_output_key_absent(self):
+        """When the chain's output_key is genuinely absent from the result dict
+        (e.g. a caller wraps a non-ValidLLMChain runnable whose output uses a
+        different key -- this class documents that it "can wrap any third-party
+        LLM framework"), _extract_output() falls back to str(result). That
+        fallback must NOT be silent: it emits a logger.warning so the skip
+        leaves a visible trace, mirroring ValidLLMChain._sanitize_dict()'s
+        handling of the analogous key-not-found case (an unlogged skip there is
+        a bypass with no visible trace)."""
+        prompt = PromptTemplate(input_variables=["q"], template="{q}")
+        llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key="test-key")
+        chain = ValidLLMChain(llm=llm, prompt=prompt, output_sanitizer=None, output_key="text")
+        orchestrator = PortableOrchestrator(chain)
+        result = {"unexpected_key": "value"}
+        with patch.object(ValidLLMChain, "invoke", return_value=result):
+            with self.assertLogs(
+                "connectchain.orchestrators.portable_orchestrator", level="WARNING"
+            ) as captured:
+                response = orchestrator.run_sync("test_query")
+        self.assertEqual(response, str(result))
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("text", captured.output[0])
+
     @patch("connectchain.lcel.model.get_token_from_env", return_value="test_token")
     @patch("connectchain.prompts.ValidPromptTemplate", return_value=Mock(ValidPromptTemplate))
     @patch("connectchain.chains.ValidLLMChain", return_value=Mock(ValidLLMChain))

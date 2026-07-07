@@ -87,23 +87,70 @@ class TestSessionMap(unittest.TestCase):
         self.assertTrue(sm.is_expired("stale-session"))
 
     def test_thread_safety_no_race_condition(self):
-        """Concurrent reads on is_expired() must never raise or corrupt state."""
-        sm = SessionMap(expires_in=900)
-        errors: list = []
+        """A writer racing readers on the SAME session_id must never raise or
+        expose a partially-published entry.
 
-        def worker():
-            for _ in range(200):
+        The old version of this test only ever called is_expired() on a key
+        that was never registered via new_session() -- so there were no
+        concurrent writes and nothing was actually contended (it passed even
+        with self._lock removed entirely). This drives the real scenario the
+        lock protects: new_session() (writer) racing is_expired()/
+        get_valid_llm()/get_llm() (readers) on one shared key.
+
+        Note: on GIL CPython, single dict store/get operations are atomic, so
+        this test may still pass with the lock removed; its teeth are as a
+        contract/regression test if these methods ever become compound
+        (multi-step) mutations, and on free-threaded (no-GIL) builds.
+        """
+        sm = SessionMap(expires_in=900)
+        key = "concurrent-key"
+        mock_llm = MagicMock()
+        errors: list = []
+        stop = threading.Event()
+
+        def writer():
+            for _ in range(1000):
+                if stop.is_set():
+                    return
                 try:
-                    sm.is_expired("concurrent-key")
+                    sm.new_session(key, mock_llm)
                 except Exception as exc:  # pylint: disable=broad-except
                     errors.append(exc)
+                    stop.set()
+                    return
 
-        threads = [threading.Thread(target=worker) for _ in range(10)]
+        def reader():
+            for _ in range(1000):
+                if stop.is_set():
+                    return
+                try:
+                    sm.is_expired(key)
+                    sm.get_valid_llm(key)
+                    if not sm.is_expired(key):
+                        # Documented precondition: safe once is_expired() said fresh.
+                        sm.get_llm(key)
+                except Exception as exc:  # pylint: disable=broad-except
+                    errors.append(exc)
+                    stop.set()
+                    return
+
+        threads = [threading.Thread(target=writer) for _ in range(4)]
+        threads += [threading.Thread(target=reader) for _ in range(8)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+
         self.assertEqual(errors, [], f"Race condition detected: {errors}")
+        entry = sm.session_map[key]
+        self.assertIsInstance(entry, tuple)
+        self.assertEqual(len(entry), 3)
+        cached_at, expires_in, llm = entry
+        self.assertIsInstance(cached_at, datetime)
+        self.assertEqual(expires_in, 900)
+        self.assertIs(llm, mock_llm)
+        self.assertFalse(sm.is_expired(key))
+        self.assertIs(sm.get_valid_llm(key), mock_llm)
 
     def test_concurrent_first_construction_yields_single_consistent_instance(self):
         """CODE-REVIEW FOLLOWUP regression: __new__'s singleton construction was

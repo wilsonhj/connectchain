@@ -249,6 +249,17 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         azure_api_key = _resolve_direct_api_key_(model_config)
         return _get_direct_azure_model_(model_config, azure_api_key, api_base)
 
+    if model_config.provider not in _SUPPORTED_PROVIDERS:
+        # Reject unsupported providers before attempting init_chat_model(), so a
+        # genuinely unsupported provider fails fast with the correct "not supported"
+        # error instead of first emitting a misleading "falling back to manual
+        # provider init" warning (or, if init_chat_model() happens not to raise for
+        # an unrecognised provider name, silently succeeding with the wrong model).
+        raise LCELModelException(
+            f"Provider '{model_config.provider}' not supported. "
+            f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
+        )
+
     # Add temperature if specified. Note: getattr's default is never returned here
     # because ConfigWrapper.__getattr__ returns None (not AttributeError) for a
     # missing key, so we must check the resolved value instead of using hasattr().
@@ -294,21 +305,17 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
             e,
         )
     except Exception as e:  # pylint: disable=broad-except
-        # Unexpected failure: preserve the original traceback.
+        # Unexpected failure: preserve the original traceback. Use getattr for the
+        # model name so constructing this message can never raise a second, uncaught
+        # exception (e.g. when the original failure was model_config.model_name itself
+        # raising AttributeError on a malformed config).
         raise LCELModelException(
-            f"Unexpected error initialising model '{model_config.model_name}': {e}"
+            f"Unexpected error initialising model "
+            f"'{getattr(model_config, 'model_name', '<unknown>')}': {e}"
         ) from e
 
-    # ── Manual provider-specific initialisation fallback (Azure already handled above) ──
-    if model_config.provider not in _SUPPORTED_PROVIDERS:
-        # Check provider support before the API-key lookup below, so an
-        # unsupported provider fails fast with a clear message instead of a
-        # misleading "API key not found" error for a key it never needed.
-        raise LCELModelException(
-            f"Provider '{model_config.provider}' not supported. "
-            f"Supported providers: {', '.join(_SUPPORTED_PROVIDERS)}"
-        )
-
+    # ── Manual provider-specific initialisation fallback (Azure and unsupported
+    # providers already handled above) ──────────────────────────────────────
     api_key = _resolve_direct_api_key_(model_config)
 
     if model_config.provider == "openai":

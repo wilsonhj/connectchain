@@ -12,12 +12,15 @@
 """
 This module contains the PortableOrchestrator class.
 """
+import logging
 from typing import Any, List
 
 import connectchain.chains
 import connectchain.prompts
 import connectchain.utils
 from connectchain.lcel import model
+
+logger = logging.getLogger(__name__)
 
 
 class PortableOrchestrator:
@@ -87,5 +90,10 @@ class PortableOrchestrator:
             value = result.get(output_key, missing)
             if value is not missing:
                 return value
+            logger.warning(
+                "output_key '%s' not found in result; falling back to str(result). Keys: %s",
+                output_key,
+                list(result.keys()),
+            )
             return str(result)
         return result
