@@ -414,6 +414,45 @@ class TestModel(unittest.TestCase):
             with self.assertRaisesRegex(LCELModelException, "api_version is required"):
                 _get_direct_model_(model_config)
 
+    def test_type_azure_field_forces_azure_routing(self):
+        """CODE-REVIEW regression: config_examples.yml documents `type: azure` (with
+        `provider: openai`) as a standalone, sufficient way to declare an Azure model --
+        the EAS path (_get_openai_model_) already treats `type` as authoritative. The
+        direct/non-EAS path must match: a config with `type: azure`, no `azure: true`
+        flag, and a custom/APIM api_base that doesn't match the known hostname markers
+        must still route to the Azure builder instead of silently falling through to a
+        plain (non-Azure) ChatOpenAI/init_chat_model() with no api_version set. Reaching
+        the api_version guard proves Azure routing happened."""
+        model_config = wrap_model_config(
+            {
+                "provider": "openai",
+                "model_name": "gpt-4",
+                "api_base": "https://llm-gw.mycorp.example/",
+                "type": "azure",
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with self.assertRaisesRegex(LCELModelException, "api_version is required"):
+                _get_direct_model_(model_config)
+
+    def test_type_azure_field_is_case_insensitive(self):
+        """CODE-REVIEW regression: a config author may write `type: Azure` or
+        `type: AZURE`; the `type` signal in _is_azure_endpoint_ must be matched
+        case-insensitively like the hostname check already is."""
+        for type_value in ("Azure", "AZURE"):
+            with self.subTest(type_value=type_value):
+                model_config = wrap_model_config(
+                    {
+                        "provider": "openai",
+                        "model_name": "gpt-4",
+                        "api_base": "https://llm-gw.mycorp.example/",
+                        "type": type_value,
+                    }
+                )
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+                    with self.assertRaisesRegex(LCELModelException, "api_version is required"):
+                        _get_direct_model_(model_config)
+
     @patch("connectchain.lcel.model.logger")
     @patch("langchain.chat_models.init_chat_model")
     def test_api_key_env_unset_warns_and_falls_back_to_default_env_on_fast_path(

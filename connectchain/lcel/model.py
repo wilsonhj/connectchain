@@ -145,8 +145,15 @@ _AZURE_ENDPOINT_MARKERS = ("openai.azure.com", "openai.azure.us", "openai.azure.
 
 
 def _is_azure_endpoint_(model_config: Any, api_base: Any) -> bool:
-    """Whether this config targets Azure OpenAI: either an api_base whose HOSTNAME is
-    on a known Azure domain, or an explicit `azure: true` flag for custom/APIM domains.
+    """Whether this config targets Azure OpenAI: an explicit `azure: true` flag, a
+    `type: azure` field (matched case-insensitively, e.g. `Azure`/`AZURE`), or an
+    api_base whose HOSTNAME is on a known Azure domain.
+
+    `type: azure` is the same standalone signal config_examples.yml documents (paired
+    with `provider: openai`) and that the EAS path (_get_openai_model_) already treats
+    as authoritative; this direct/non-EAS path must recognise it too, for custom/APIM
+    api_base values that the hostname check below can't detect and that don't set the
+    `azure: true` flag.
 
     The hostname is extracted with urlparse and suffix-matched (exact host or a
     subdomain, i.e. host == marker or host.endswith("." + marker)) rather than
@@ -156,6 +163,8 @@ def _is_azure_endpoint_(model_config: Any, api_base: Any) -> bool:
     to the Azure builder.
     """
     if getattr(model_config, "azure", None):
+        return True
+    if str(getattr(model_config, "type", None) or "").lower() == "azure":
         return True
     if not api_base:
         return False
