@@ -57,6 +57,25 @@ class TestSessionMap(unittest.TestCase):
             test_uuid, "mod_id_mod_sec_oss_provider_some_model_type_oss_engine_some_model_latest"
         )
 
+    def test_uuid_from_config_partial_model_eas_falls_back_per_key(self):
+        """A per-model eas section that overrides only SOME keys must fall back to
+        the global section for the rest, and missing optional model fields must
+        keep rendering as the literal "None" placeholder: uuid_from_config is a
+        cache-key builder, not a validator, so it must not start raising now that
+        ConfigWrapper is strict about missing attributes."""
+        test_config = get_mock_config()
+        test_model_config = wrap_model_config(
+            {
+                "eas": {"id_key": "mod_id"},  # no secret_key -> global fallback
+                "provider": "openai",
+                "type": "chat",
+                "model_name": "m",
+                # no engine / api_version -> "None" placeholders in the key
+            }
+        )
+        test_uuid = SessionMap.uuid_from_config(test_config, test_model_config)
+        self.assertEqual(test_uuid, "mod_id_secret_key_openai_chat_None_m_None")
+
     # ── BUG-2 FIX: regression tests ─────────────────────────────────────────
 
     def test_is_expired_unknown_session_returns_true(self):
@@ -243,9 +262,52 @@ class TestSessionMap(unittest.TestCase):
         SessionMap(60)
         self.assertEqual(sm.expires_in, 60)
 
+    def test_reconfigure_with_unchanged_value_skips_locked_write(self):
+        """CODE-REVIEW regression: SessionMap(value) is constructed on the model()
+        hot path, and value almost always equals the already-configured default.
+        Unconditionally taking self._lock -- shared with every session_map cache
+        read/write -- just to rewrite an identical int was pure lock contention,
+        so an unchanged value must skip the locked write entirely. An actual
+        change must still take the lock (the write may not interleave with
+        new_session()'s locked fallback read), and a bare SessionMap() still
+        never reconfigures."""
+        sm = SessionMap(900)
+
+        class CountingLock:
+            """Context-manager lock wrapper that counts acquisitions."""
+
+            def __init__(self):
+                self.acquisitions = 0
+                self._inner = threading.Lock()
+
+            def __enter__(self):
+                self.acquisitions += 1
+                self._inner.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self._inner.release()
+                return False
+
+        counting_lock = CountingLock()
+        sm._lock = counting_lock  # pylint: disable=protected-access
+
+        SessionMap(900)  # unchanged value: no locked write
+        self.assertEqual(counting_lock.acquisitions, 0)
+        self.assertEqual(sm.expires_in, 900)
+
+        SessionMap()  # bare construction: "don't reconfigure", never locks
+        self.assertEqual(counting_lock.acquisitions, 0)
+        self.assertEqual(sm.expires_in, 900)
+
+        SessionMap(60)  # actual reconfiguration: locked write, value updated
+        self.assertEqual(counting_lock.acquisitions, 1)
+        self.assertEqual(sm.expires_in, 60)
+
     def test_missing_token_refresh_interval_uses_default_not_none(self):
         """CODE-REVIEW regression: a config without eas.token_refresh_interval reaches
-        SessionMap as None (ConfigWrapper returns None for missing keys). That must
+        SessionMap as None (the model() path resolves the missing key to None via
+        getattr's default). That must
         fall back to the default -- previously the entry cached expires_in=None and
         every later cache-hit expiry check crashed with TypeError ('>' vs NoneType)."""
         sm = SessionMap(None)

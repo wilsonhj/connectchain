@@ -65,9 +65,22 @@ class SessionMap:
                     cls._instance = new_instance
                     return cls._instance
         if expires_in is not None:
-            # Guarded so the write can't interleave with new_session()'s fallback read.
-            with cls._instance._lock:
-                cls._instance.expires_in = expires_in
+            # Reconfigure only when the value actually changes. Every EAS-routed
+            # model() call constructs SessionMap(expires_in) on its hot path, and
+            # the value is almost always the one already configured, so
+            # unconditionally taking self._lock -- shared with every session_map
+            # cache read/write -- just to rewrite an identical int was pure lock
+            # contention. The preliminary comparison deliberately reads
+            # expires_in WITHOUT the lock: the read is a single atomic attribute
+            # fetch, and the worst a racing reconfiguration can do is make the
+            # comparison see the older or newer of two concurrently requested
+            # values -- the same last-writer-wins outcome the unconditional
+            # locked write had, so the benign race changes no observable
+            # semantics. The write itself stays locked so it cannot interleave
+            # with new_session()'s locked fallback read of self.expires_in.
+            if cls._instance.expires_in != expires_in:
+                with cls._instance._lock:
+                    cls._instance.expires_in = expires_in
         return cls._instance
 
     def new_session(
@@ -133,17 +146,26 @@ class SessionMap:
 
     @staticmethod
     def uuid_from_config(config: Any, model_config: Any) -> str:
-        """Generate a UUID from the config."""
-        env_id_key = None
-        env_secret_key = None
-        if model_config.eas:
-            env_id_key = model_config.eas.id_key
-            env_secret_key = model_config.eas.secret_key
+        """Generate a stable cache key from the config.
+
+        A partial per-model eas section overrides the global one key-by-key,
+        falling back to the global section for whichever keys it omits. Every
+        read here uses getattr's None default: this is a cache-key builder,
+        not a validator -- keys that are genuinely required are validated at
+        their point of use, and a missing optional key must keep rendering as
+        the literal "None" placeholder in the key (as it always has) rather
+        than raising now that Config/ConfigWrapper are strict about missing
+        attributes."""
+        model_eas = getattr(model_config, "eas", None)
+        env_id_key = getattr(model_eas, "id_key", None)
         if env_id_key is None:
-            env_id_key = config.eas.id_key
+            env_id_key = getattr(getattr(config, "eas", None), "id_key", None)
+        env_secret_key = getattr(model_eas, "secret_key", None)
         if env_secret_key is None:
-            env_secret_key = config.eas.secret_key
+            env_secret_key = getattr(getattr(config, "eas", None), "secret_key", None)
         env_uuid = f"{env_id_key}_{env_secret_key}"
-        model_uuid = f"{model_config.provider}_{model_config.type}_{model_config.engine}"
-        model_uuid += f"_{model_config.model_name}_{model_config.api_version}"
+        model_uuid = "_".join(
+            str(getattr(model_config, key, None))
+            for key in ("provider", "type", "engine", "model_name", "api_version")
+        )
         return f"{env_uuid}_{model_uuid}"

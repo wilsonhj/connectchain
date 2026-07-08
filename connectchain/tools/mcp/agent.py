@@ -63,35 +63,48 @@ class MCPToolAgent(Runnable):  # pylint: disable=redefined-builtin
         # parameters) actually reach the underlying model instead of being silently dropped.
         response = await llm.ainvoke(input, config, **kwargs)
 
+        # Extract the content once -- it's the same expression on every return path, and
+        # duplicating it at each return site invites the two copies drifting apart.
+        content = response.content if isinstance(response, BaseMessage) else str(response)
+
         if not hasattr(response, "tool_calls") or not response.tool_calls:
             # Match the declared `-> dict` contract on every path, not just when tools
             # are requested -- otherwise callers can't uniformly do result["content"].
-            return {
-                "content": response.content if isinstance(response, BaseMessage) else str(response),
-                "tool_results": [],
-            }
+            return {"content": content, "tool_results": []}
 
-        results = []
+        async def execute_tool(tool_name: str, tool_args: Any) -> dict:
+            """Run a single tool, mapping any failure to an error entry so one failing
+            tool never affects its siblings."""
+            try:
+                result = await self.tools[tool_name].ainvoke(tool_args)
+                return {"tool": tool_name, "result": result}
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    "Tool '%s' execution failed: %s", tool_name, e
+                )
+                return {"tool": tool_name, "error": str(e)}
+
+        pending = []
         for tool_call in response.tool_calls:
             tool_name = tool_call.get("name") if isinstance(tool_call, dict) else tool_call.name
             tool_args = tool_call.get("args", {}) if isinstance(tool_call, dict) else tool_call.args
 
             if tool_name in self.tools:
-                try:
-                    result = await self.tools[tool_name].ainvoke(tool_args)
-                    results.append({"tool": tool_name, "result": result})
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(
-                        "Tool '%s' execution failed: %s", tool_name, e
-                    )
-                    results.append({"tool": tool_name, "error": str(e)})
+                pending.append(execute_tool(tool_name, tool_args))
             else:
+                # Unknown tools only produce a warning; they contribute no entry to
+                # tool_results (preserving the long-standing behavior).
                 logger.warning("Unknown tool requested: %s", tool_name)
 
-        return {
-            "content": response.content if isinstance(response, BaseMessage) else str(response),
-            "tool_results": results,
-        }
+        # Run the requested tools concurrently rather than awaiting them one by one.
+        # gather() is safe here because the tool calls are independent of each other
+        # and MCP sessions handle concurrent calls; per-tool failures are already
+        # absorbed inside execute_tool, so one slow or failing tool cannot affect the
+        # rest. gather() also preserves ordering: results arrive in the same order as
+        # response.tool_calls (minus unknown tools), regardless of completion order.
+        results = list(await asyncio.gather(*pending))
+
+        return {"content": content, "tool_results": results}
 
     def invoke(
         self,

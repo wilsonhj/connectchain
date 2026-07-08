@@ -70,6 +70,44 @@ class TestModel(unittest.TestCase):
         test_token = os.getenv("TEST_MODEL_ENV")
         self.assertEqual(test_token, "test_token")
 
+    def test_model_without_eas_section_routes_direct(self):
+        """A config with NO eas section at all must route to the direct
+        (non-EAS) path instead of crashing: now that Config raises
+        AttributeError for missing top-level keys, the routing check probes
+        the section via getattr defaults, which genuinely work."""
+        test_config = get_mock_config()
+        del test_config.data["eas"]
+        mocks = self.setUpWithConfig(test_config)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            test_model = model()
+        self.assertIsInstance(test_model, ChatOpenAI)
+        mocks["token"].assert_not_called()
+
+    def test_model_with_empty_eas_section_routes_direct(self):
+        """A bare `eas:` line in YAML parses to None. Attribute access on the
+        wrapped None section raises AttributeError (formerly TypeError, which
+        blew through the routing check's except clause), so the getattr-based
+        probe must degrade to direct routing."""
+        test_config = get_mock_config()
+        test_config.data["eas"] = None
+        mocks = self.setUpWithConfig(test_config)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            test_model = model()
+        self.assertIsInstance(test_model, ChatOpenAI)
+        mocks["token"].assert_not_called()
+
+    def test_model_with_eas_section_missing_id_key_routes_direct(self):
+        """An eas section without an id_key cannot authenticate through EAS, so
+        the model must route direct -- getattr's default (now honored for
+        missing ConfigWrapper keys) is what makes this presence check work."""
+        test_config = get_mock_config()
+        test_config.data["eas"] = {"secret_key": "secret_key"}
+        mocks = self.setUpWithConfig(test_config)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            test_model = model()
+        self.assertIsInstance(test_model, ChatOpenAI)
+        mocks["token"].assert_not_called()
+
     def test_model_with_no_models_configured(self):
         test_config = get_mock_config()
         del test_config.data["models"]
@@ -277,7 +315,8 @@ class TestModel(unittest.TestCase):
     # pylint: disable=unused-argument
     def test_unset_token_refresh_interval_resolved_before_network_call(self, *args):
         """CODE-REVIEW regression: when config.eas.token_refresh_interval is unset
-        (ConfigWrapper resolves missing keys to None), the expiry interval must be
+        (the model() path resolves the missing key to None via getattr's default),
+        the expiry interval must be
         resolved to SessionMap.DEFAULT_EXPIRES_IN at capture time -- BEFORE
         get_token_from_env()'s network call -- and passed to new_session() as an
         explicit int. Passing None through would make new_session() fall back to the
@@ -445,6 +484,28 @@ class TestModel(unittest.TestCase):
             ),
             "warning must name the unset env var",
         )
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_temperature_forwarded_on_fast_path(self, mock_init_chat_model):
+        """Companion to the manual-fallback temperature tests: the init_chat_model()
+        fast path builds its temperature kwarg through the shared
+        _temperature_kwargs_() helper (it used to hand-roll the same logic), so a
+        configured temperature must be forwarded..."""
+        model_config = wrap_model_config(
+            {"provider": "openai", "model_name": "gpt-4", "temperature": 0.25}
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            _get_direct_model_(model_config)
+        self.assertEqual(mock_init_chat_model.call_args.kwargs["temperature"], 0.25)
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_unset_temperature_not_forced_on_fast_path(self, mock_init_chat_model):
+        """...and an unset temperature must be omitted entirely (each provider keeps
+        its own default) rather than forced to None."""
+        model_config = wrap_model_config({"provider": "openai", "model_name": "gpt-4"})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            _get_direct_model_(model_config)
+        self.assertNotIn("temperature", mock_init_chat_model.call_args.kwargs)
 
     def test_temperature_honored_on_manual_fallback_path(self):
         """CODE-REVIEW regression: configured temperature was only honored on the
