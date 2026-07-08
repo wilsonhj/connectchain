@@ -153,11 +153,29 @@ class TestMCPToolAgent:
         with patch("connectchain.tools.mcp.agent.asyncio.run") as mock_asyncio_run:
             # Simulate the RuntimeError that occurs when asyncio.run() is called from within an event loop
             mock_asyncio_run.side_effect = RuntimeError("asyncio.run() cannot be called from a running event loop")
-            
+
             agent = MCPToolAgent("1", mock_tools)
 
             with pytest.raises(RuntimeError, match="MCPToolAgent.invoke\\(\\) failed"):
                 agent.invoke({"query": "test"})
+
+    def test_duplicate_tool_name_logs_warning(self, caplog):
+        """Regression test: when two different MCP servers expose tools with the same
+        name, merging them into the `self.tools` dict must log a warning so the silent
+        override (later tool wins) is visible instead of a silent collision."""
+        first_add_tool = Mock(spec=BaseTool)
+        first_add_tool.name = "add"
+
+        second_add_tool = Mock(spec=BaseTool)
+        second_add_tool.name = "add"
+
+        with caplog.at_level("WARNING", logger="connectchain.tools.mcp.agent"):
+            agent = MCPToolAgent("1", [first_add_tool, second_add_tool])
+
+        assert "Duplicate tool name" in caplog.text
+        assert "add" in caplog.text
+        # The later tool overrides the earlier one.
+        assert agent.tools["add"] is second_add_tool
 
 
 class TestMCPToolLoader:
@@ -221,6 +239,25 @@ class TestMCPToolLoader:
             assert "math_tools" in call_args
             assert "web_tools" not in call_args
 
+
+    @pytest.mark.asyncio
+    async def test_load_tools_empty_list_connects_to_zero_servers(self, mock_config):
+        """Regression test: `server_names=[]` (explicit empty list) means "connect to
+        zero servers", not "no filter requested" (which is what `None` means). Before
+        the fix, `load_tools` used a truthiness check so `[]` was treated the same as
+        `None` and all configured servers' tools were returned instead of none."""
+        with patch("connectchain.tools.mcp.loader.MultiServerMCPClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.get_tools = AsyncMock(return_value=[])
+            mock_client_class.return_value = mock_client
+
+            loader = MCPToolLoader(mock_config)
+            tools = await loader.load_tools([])
+
+            assert tools == []
+            # No servers should have been passed to the client.
+            call_args = mock_client_class.call_args[0][0]
+            assert call_args == {}
 
     @pytest.mark.asyncio
     async def test_no_servers_configured(self):

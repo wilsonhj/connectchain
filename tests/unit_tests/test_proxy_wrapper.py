@@ -46,6 +46,18 @@ class MockLLM:
         return self._test
 
 
+class HasattrRaisesValueErrorLLM:
+    """Mock LLM whose `__getattr__` raises ValueError for a specific attribute name,
+    the way a pydantic-backed object can. This makes `hasattr(llm, method_name)`
+    itself raise ValueError (not just `getattr`), since `hasattr` calls `getattr`
+    internally and only treats `AttributeError` as "does not exist"."""
+
+    def __getattr__(self, name):
+        if name == "invoke":
+            raise ValueError(f"pydantic misbehavior accessing '{name}'")
+        raise AttributeError(name)
+
+
 class TestProxyWrapping(unittest.TestCase):
     """Unit testing the proxy wrapping methods"""
 
@@ -91,6 +103,31 @@ class TestProxyWrapping(unittest.TestCase):
 
         test_wrapping_an_existing_method()
         test_wrapping_nonexistant_method()
+
+    def test_wrap_method_hasattr_raises_value_error(self):
+        """Regression test: `hasattr(llm, method_name)` itself can raise ValueError for
+        a pydantic-backed object (not just `getattr`). Before the fix, only the
+        `getattr` call was wrapped in the try/except ValueError, so a ValueError raised
+        by `hasattr` propagated uncaught instead of being handled like any other
+        inaccessible attribute."""
+        mock_llm = HasattrRaisesValueErrorLLM()
+        mock_manager = Mock()
+        mock_decorator = Mock()
+
+        # Should not raise -- must be handled gracefully, same as a nonexistent method.
+        _wrap_method_(mock_manager, mock_llm, "invoke", mock_decorator)
+
+        mock_decorator.assert_not_called()
+        self.assertNotIn("invoke", mock_llm.__dict__)
+
+    def test_wrapping_llm_with_hasattr_raising_value_error(self):
+        """Regression test: `wrap_llm_with_proxy` (the public entry point) must not
+        crash when the underlying LLM raises ValueError from `hasattr` for one of the
+        methods it tries to wrap."""
+        mock_llm = HasattrRaisesValueErrorLLM()
+
+        # Should not raise.
+        wrap_llm_with_proxy(mock_llm, proxy_config=None)
 
     @patch("connectchain.utils.llm_proxy_wrapper._wrap_method_")
     def test_wrapping_llm(self, wrap_mock: Mock):
