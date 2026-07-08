@@ -12,7 +12,7 @@
 """LCEL model module"""
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from langchain.schema.language_model import BaseLanguageModel
@@ -63,24 +63,23 @@ def _get_model_(index: Any) -> BaseLanguageModel:
     config = Config.from_env()
     try:
         models = config.models
-    except KeyError as ex:
+    except AttributeError as ex:
+        # Config raises AttributeError for a missing top-level key.
         raise LCELModelConfigError("No models defined in config") from ex
     model_config = models[index]
     if model_config is None:
         raise LCELModelConfigError(f'Model config at index "{index}" is not defined')
 
-    needs_eas = False
-    try:
-        if (
-            hasattr(config, "eas")
-            and config.eas
-            and hasattr(config.eas, "id_key")
-            and config.eas.id_key
-            and not getattr(model_config, "bypass_eas", False)
-        ):
-            needs_eas = True
-    except (AttributeError, KeyError):
-        needs_eas = False
+    # EAS routing requires an eas section carrying a truthy id_key, unless the
+    # model opts out via bypass_eas. getattr's default genuinely works now that
+    # Config/ConfigWrapper raise AttributeError for missing keys -- and also
+    # for a section left empty in YAML (`eas:` parses to None, and attribute
+    # access on a None-holding wrapper raises AttributeError too) -- so the
+    # try/except probe cascade this replaces is no longer needed.
+    eas_config = getattr(config, "eas", None)
+    needs_eas = bool(getattr(eas_config, "id_key", None)) and not getattr(
+        model_config, "bypass_eas", False
+    )
 
     if model_config.provider != "openai":
         needs_eas = False
@@ -92,17 +91,13 @@ def _get_model_(index: Any) -> BaseLanguageModel:
 
     if model_instance is None:
         raise LCELModelConfigError("Not implemented")
-    try:
-        proxy_config = model_config.proxy
-    except KeyError:
-        pass
+    # A model-level proxy overrides the global one; both are optional, so both
+    # reads use getattr's None default (missing keys raise AttributeError now).
+    proxy_config = getattr(model_config, "proxy", None)
     if proxy_config is None:
-        try:
-            proxy_config = config.proxy
-        except KeyError:
-            pass
+        proxy_config = getattr(config, "proxy", None)
     if proxy_config is not None:
-        wrap_llm_with_proxy(model_instance, proxy_config)  # type: ignore[arg-type]
+        wrap_llm_with_proxy(model_instance, proxy_config)
     return model_instance
 
 
@@ -117,7 +112,8 @@ def _get_openai_model_(index: Any, config: Any, model_config: Any) -> BaseLangua
     # matters for the same reason: passing None would make new_session() fall back
     # to the singleton's CURRENT expires_in after the network call, reopening the
     # race and inheriting whatever interval another model configured last.
-    expires_in = config.eas.token_refresh_interval
+    # token_refresh_interval is optional, hence getattr's None default.
+    expires_in = getattr(config.eas, "token_refresh_interval", None)
     if expires_in is None:
         expires_in = SessionMap.DEFAULT_EXPIRES_IN
     session_map = SessionMap(expires_in)
@@ -198,8 +194,10 @@ def _require_api_version_(model_config: Any, api_base: Any) -> Any:
 
 def _temperature_kwargs_(model_config: Any) -> dict:
     """{'temperature': t} when configured, else {} -- so an unset temperature keeps
-    each provider's own default instead of being forced to None. Checked via the
-    resolved value (not hasattr) for the same ConfigWrapper reason as elsewhere."""
+    each provider's own default instead of being forced to None. getattr's None
+    default covers a missing key (ConfigWrapper raises AttributeError for those)
+    as well as an explicit `temperature: null`, and works the same for plain
+    (non-ConfigWrapper) config objects."""
     temperature = getattr(model_config, "temperature", None)
     return {} if temperature is None else {"temperature": temperature}
 
@@ -277,6 +275,34 @@ def _resolve_direct_api_key_(model_config: Any) -> str:
     return api_key
 
 
+def _resolve_fast_path_api_key_(model_config: Any) -> Optional[str]:
+    """Resolve an explicitly configured api_key_env for the init_chat_model()
+    fast path, returning None whenever resolution should instead be left to
+    init_chat_model()'s own provider-default handling.
+
+    Companion to _resolve_direct_api_key_ (the manual-fallback resolver); the
+    two deliberately differ on an UNSET named env var. Here we must not fail
+    hard: init_chat_model() resolves the provider's own default env var (e.g.
+    OPENAI_API_KEY) when no explicit api_key is passed, which may well work.
+    The misconfiguration is surfaced loudly via logger.warning, then init
+    proceeds without an explicit key. (The manual fallback path still
+    hard-fails via _resolve_direct_api_key_ if no key is resolvable at all.)
+    """
+    api_key_env = getattr(model_config, "api_key_env", None)
+    if not api_key_env:
+        return None
+    api_key = os.getenv(api_key_env)
+    if api_key:
+        return api_key
+    logger.warning(
+        "api_key_env is set to '%s' but that environment variable is unset; "
+        "falling back to the provider's default API-key environment variable "
+        "resolution.",
+        api_key_env,
+    )
+    return None
+
+
 def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
     """Get a direct API model instance for any provider without EAS authentication.
 
@@ -300,30 +326,9 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         azure_api_key = _resolve_direct_api_key_(model_config)
         return _get_direct_azure_model_(model_config, azure_api_key, api_base)
 
-    # Add temperature if specified. Note: getattr's default is never returned here
-    # because ConfigWrapper.__getattr__ returns None (not AttributeError) for a
-    # missing key, so we must check the resolved value instead of using hasattr().
-    temperature = getattr(model_config, "temperature", None)
-
     # Resolved before the try block so the env lookup can't be mistaken for an
     # "unexpected" init error by the `except Exception` below.
-    api_key_env = getattr(model_config, "api_key_env", None)
-    explicit_api_key = None
-    if api_key_env:
-        explicit_api_key = os.getenv(api_key_env)
-        if not explicit_api_key:
-            # The config names an env var that isn't set. Don't fail hard here:
-            # init_chat_model() resolves the provider's own default env var (e.g.
-            # OPENAI_API_KEY) when no explicit api_key is passed, which may well
-            # work. Surface the misconfiguration loudly, then proceed without an
-            # explicit key. (The manual fallback path below still fails clearly
-            # via _resolve_direct_api_key_ if no key is resolvable at all.)
-            logger.warning(
-                "api_key_env is set to '%s' but that environment variable is unset; "
-                "falling back to the provider's default API-key environment variable "
-                "resolution.",
-                api_key_env,
-            )
+    explicit_api_key = _resolve_fast_path_api_key_(model_config)
 
     try:
         from langchain.chat_models import init_chat_model  # pylint: disable=import-outside-toplevel
@@ -331,10 +336,9 @@ def _get_direct_model_(model_config: Any) -> BaseLanguageModel:
         model_name = model_config.model_name
         config_dict: dict = {}
 
-        if hasattr(model_config, "api_base") and model_config.api_base:
-            config_dict["base_url"] = model_config.api_base
-        if temperature is not None:
-            config_dict["temperature"] = temperature
+        if api_base:
+            config_dict["base_url"] = api_base
+        config_dict.update(_temperature_kwargs_(model_config))
         if explicit_api_key:
             config_dict["api_key"] = explicit_api_key
         if model_config.provider not in _SUPPORTED_PROVIDERS:
