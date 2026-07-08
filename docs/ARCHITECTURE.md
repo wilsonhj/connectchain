@@ -78,7 +78,7 @@ ConnectChain currently imports from LangChain in one critical path:
 
 ```
 connectchain.chains.ValidLLMChain
-  └── inherits langchain.chains.llm.LLMChain      ← deprecated since 0.1.0, removed in LangChain 1.0
+  └── inherits langchain.chains.llm.LLMChain      ← deprecated since 0.1.17, removed in LangChain 1.0
                                                      (per LLMChain's own LangChainDeprecationWarning)
 ```
 
@@ -179,8 +179,8 @@ they do, not as an open worklist.
 
 | Area | File | Root Cause (as found) | Resolution |
 |------|------|-----------|-------------|
-| Output sanitizer bypass (input vs. response) | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `invoke()`/`ainvoke()` sanitize the response; `run()`/`arun()` return it as-is since they dispatch through `invoke()`/`ainvoke()` internally (see next row) |
-| Output sanitizer applied twice | `chains/valid_llm_chain.py` | `run()`/`arun()` sanitized the result AND dispatched through `Chain.__call__` → `self.invoke()`/`self.ainvoke()`, which (via Python's polymorphism) already sanitized it once — e.g. `"[S:RAW]"` became `"[S:[S:RAW]]"` | `run()`/`arun()` no longer sanitize directly; they rely entirely on the `invoke()`/`ainvoke()` dispatch |
+| Output sanitizer bypass (input vs. response) | `chains/valid_llm_chain.py` | `output_sanitizer` was applied to the user's input, not the LLM's response | `_call()`/`_acall()` sanitize the response dict directly; `run()`/`arun()`/`invoke()`/`ainvoke()` all dispatch through `_call()`/`_acall()` internally, so overriding those two covers every public entry point (see next row) |
+| Output sanitizer applied twice | `chains/valid_llm_chain.py` | `run()`/`arun()` sanitized the result AND dispatched through `Chain.__call__` → `self.invoke()`/`self.ainvoke()`, which (via Python's polymorphism) already sanitized it once — e.g. `"[S:RAW]"` became `"[S:[S:RAW]]"` | `run()`/`arun()`/`invoke()`/`ainvoke()` are no longer overridden at all; sanitization happens exactly once, inside `_call()`/`_acall()`, regardless of which public entry point is used |
 | SessionMap KeyError | `utils/session_map.py` | `is_expired()` indexed the session dict directly, raising `KeyError` for an unregistered session | Existence + expiry are now checked together (`get_valid_llm()`), returning `None`/`True` instead of raising |
 | SessionMap singleton construction race | `utils/session_map.py` | `__new__`'s `cls._instance is None` check (and, in an earlier fix, the instance-attribute assignment order) had unguarded/unsafe windows under concurrent first construction | Double-checked locking via a class-level `_instance_lock`; the instance is fully built on a local variable before being published to `cls._instance` |
 | Deprecated LangChain API | `orchestrators/portable_orchestrator.py` | Called `LLMChain.run()`/`.arun()`, deprecated since LangChain 0.1.0 | Now uses `.invoke()`/`.ainvoke()` |

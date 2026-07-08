@@ -33,7 +33,7 @@ Bug fixes are tracked as GitHub issues/PRs, not in this file — see the repo's 
 
 **Scope:** `connectchain/chains/valid_llm_chain.py`, and anything constructing it directly.
 **Why:** `ValidLLMChain` inherits `langchain.chains.llm.LLMChain`, which LangChain's own
-`LangChainDeprecationWarning` says was deprecated in 0.1.0 and will be removed in LangChain 1.0.
+`LangChainDeprecationWarning` says was deprecated in 0.1.17 and will be removed in LangChain 1.0.
 `pyproject.toml` currently pins `langchain<0.4.0` to avoid that break; this refactor would be needed
 before ever lifting that pin.
 
