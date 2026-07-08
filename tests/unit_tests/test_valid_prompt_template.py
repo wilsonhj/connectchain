@@ -43,6 +43,34 @@ class TestValidPromptTemplate(TestCase):
         with self.assertRaises(OperationNotPermittedException):
             prompt.format_prompt(topic="BADWORD")
 
+    def test_format_prompt_sanitizes_rendered_output_not_raw_fields(self):
+        """Sanitizer must see the fully rendered output, not each raw field in isolation.
+
+        Splitting "BADWORD" across two template fields means neither field alone
+        contains the disallowed pattern -- only the rendered result does. A sanitizer
+        that runs on raw per-field inputs before rendering (the old, buggy behavior)
+        would miss this; the fix runs the sanitizer on the rendered output instead.
+        """
+
+        def output_sanitizer(query: str) -> str:
+            pattern = r"BADWORD"
+
+            if re.search(pattern, query):
+                print("BADWORD found!")
+                raise OperationNotPermittedException(f"Illegal execution detected: {query}")
+
+        prompt_template = "Tell me something interesting about {a}{b}."
+        prompt = ValidPromptTemplate(
+            output_sanitizer=output_sanitizer,
+            input_variables=["a", "b"],
+            template=prompt_template,
+        )
+
+        # Neither "BAD" nor "WORD" alone matches the pattern; only the rendered
+        # concatenation "BADWORD" does.
+        with self.assertRaises(OperationNotPermittedException):
+            prompt.format_prompt(a="BAD", b="WORD")
+
     def test_no_sanitizer(self):
         """method to test no_sanitizer"""
         prompt_template = "Tell me something interesting about {topic}."
